@@ -205,6 +205,14 @@ def _build_app():
         max_chats: int = 1000
         max_photos: int = 2000
 
+    class SendProbeIn(BaseModel):
+        phone: str
+        marker: str = ""
+        count: int = 3
+
+    class SessionOpIn(BaseModel):
+        phone: str
+
     class ChannelCreateIn(BaseModel):
         phone: str
         marker: str
@@ -730,6 +738,110 @@ def _build_app():
         if job:
             job["stopped"] = True
         return {"stopped": True}
+
+    # ----- send-test (probe) + session ops (for the worker-transfer flow) -----
+    @app.post("/sendprobe")
+    async def sendprobe(body: SendProbeIn, authorization: str = Header(None)):
+        """Forward the marker message to the first N recipients to verify this
+        worker/IP can actually send. Returns counts (sent / too_requests / other)."""
+        _auth(authorization)
+
+        async def _do(client):
+            marker = body.marker or config.FORWARD_MARKER
+            saved_guid, mid = await rb.find_marked_message(client, marker)
+            if not mid:
+                return {"ok": False, "error": "marker_not_found"}
+            ordered, _stats = await rb.get_ordered_recipients(client)
+            targets = [r["guid"] for r in ordered][:max(1, int(body.count))]
+            sent = too = other = 0
+            for guid in targets:
+                try:
+                    await asyncio.wait_for(
+                        rb.forward_message(client, saved_guid, guid, mid),
+                        timeout=config.SEND_TIMEOUT)
+                    sent += 1
+                except Exception as e:  # noqa: BLE001
+                    if "too_requests" in repr(e).lower():
+                        too += 1
+                    else:
+                        other += 1
+            return {"ok": True, "sent": sent, "too_requests": too,
+                    "other": other, "total": len(targets)}
+
+        try:
+            return await account_conn.call(body.phone, _do, timeout=300)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": repr(e)[:160]}
+
+    @app.post("/session/delete")
+    async def session_delete(body: SessionOpIn, authorization: str = Header(None)):
+        """Close the warm connection and DELETE the local session file(s) on this
+        worker, so it can never use the account again (used before a transfer)."""
+        _auth(authorization)
+        import glob
+        import os as _os
+        phone = rb.normalize_phone(body.phone)
+        try:
+            await account_conn.close(phone)
+        except Exception:  # noqa: BLE001
+            pass
+        removed = []
+        try:
+            base = rb.session_path(phone)
+            for f in glob.glob(base + "*"):
+                try:
+                    _os.remove(f)
+                    removed.append(_os.path.basename(f))
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "removed": removed}
+
+    @app.post("/session/terminate_bots")
+    async def session_terminate_bots(body: SessionOpIn,
+                                     authorization: str = Header(None)):
+        """From THIS (new) worker, terminate the account's OTHER *bot* sessions
+        (PWA whose device is a file path) — e.g. the old worker's session — WITHOUT
+        touching the customer's real phone/app sessions."""
+        _auth(authorization)
+
+        async def _do(client):
+            terminated = 0
+            try:
+                res = await client.get_my_sessions()
+                data = None
+                for attr in ("to_dict", "original_update"):
+                    obj = getattr(res, attr, None)
+                    if callable(obj):
+                        try:
+                            data = obj()
+                            break
+                        except Exception:  # noqa: BLE001
+                            pass
+                    elif obj is not None:
+                        data = obj
+                        break
+                others = (data or {}).get("other_sessions") or []
+                for s in others:
+                    dev = str(s.get("device") or "")
+                    app_type = str(s.get("app_type") or "").lower()
+                    key = s.get("key")
+                    is_bot = app_type == "pwa" and (dev.startswith("/") or "acc_" in dev)
+                    if key and s.get("terminatable", True) and is_bot:
+                        try:
+                            await client.terminate_session(key)
+                            terminated += 1
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": repr(e)[:140], "terminated": terminated}
+            return {"ok": True, "terminated": terminated}
+
+        try:
+            return await account_conn.call(body.phone, _do, timeout=120)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": repr(e)[:160]}
 
     @app.get("/extras/logs")
     async def extras_logs(authorization: str = Header(None)):
