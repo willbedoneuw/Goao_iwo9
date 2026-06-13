@@ -55,6 +55,8 @@ pending_send: dict = {}
 stop_flags: dict = {}
 # accounts currently running a job
 active_jobs: set = set()
+# customers currently running a PV image export (memory-heavy; globally capped)
+pv_export_jobs: set = set()
 
 
 def now() -> str:
@@ -1162,6 +1164,16 @@ async def pvexport_run_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
+    # PV export is memory-heavy; cap concurrency to protect the server (anti-OOM).
+    if uid in pv_export_jobs:
+        await event.answer("ایمپورت قبلی‌ات هنوز در حال اجراست. صبر کن تموم بشه.",
+                           alert=True)
+        return
+    if len(pv_export_jobs) >= config.PV_EXPORT_MAX_CONCURRENT:
+        await event.answer("الان یه ایمپورت دیگه در حال اجراست. چند دقیقه بعد "
+                           "دوباره امتحان کن.", alert=True)
+        return
+    pv_export_jobs.add(uid)
     await _respond(event,
                    f"⏳ جمع‌آوری عکس‌های پیویِ {acc['phone']} ... ممکنه چند دقیقه طول بکشه.",
                    buttons=[[Button.inline("🏠 منو", b"home")]])
@@ -1169,6 +1181,14 @@ async def pvexport_run_cb(event):
 
 
 async def run_pv_export(uid: int, acc):
+    # Always release the global export slot, however this finishes.
+    try:
+        await _run_pv_export(uid, acc)
+    finally:
+        pv_export_jobs.discard(uid)
+
+
+async def _run_pv_export(uid: int, acc):
     phone = acc["phone"]
 
     async def _do(client):
