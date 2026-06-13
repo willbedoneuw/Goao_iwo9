@@ -158,7 +158,7 @@ PV_EXPORT_MAX_PHOTOS = _int("PV_EXPORT_MAX_PHOTOS", 2000)
 PV_EXPORT_MAX_CONCURRENT = _int("PV_EXPORT_MAX_CONCURRENT", 1)
 # Per-photo download timeout (seconds) during PV export, so one stuck download
 # (or a Rubika flood-wait) can't freeze the whole collection. Skipped on timeout.
-PV_DOWNLOAD_TIMEOUT = _int("PV_DOWNLOAD_TIMEOUT", 25)
+PV_DOWNLOAD_TIMEOUT = _int("PV_DOWNLOAD_TIMEOUT", 15)
 
 # ---- Pause between joining each personal group from a link list ----
 GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
