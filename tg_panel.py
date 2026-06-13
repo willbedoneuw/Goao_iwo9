@@ -60,6 +60,10 @@ _stop: dict = {}
 _active: set = set()
 # global sequential send queue (one send at a time, like the reference panel)
 _send_queue = None
+# reference to customer_bot's Rubika conversation-state dict (set in setup), so
+# entering the Telegram section can clear any half-finished Rubika flow and vice
+# versa — prevents BOTH NewMessage routers acting on the same message.
+_rubika_state = None
 
 
 def now() -> str:
@@ -184,6 +188,8 @@ async def tg_home_cb(event):
     if not await _gate(event):
         return
     _state.pop(event.sender_id, None)
+    if _rubika_state is not None:
+        _rubika_state.pop(event.sender_id, None)  # leave any Rubika flow
     await _respond(event, card("📨 پنل تلگرام", [
         "اکانت‌های تلگرامِ خودت رو اضافه کن و محتوا بفرست.",
         "یکی از گزینه‌ها رو انتخاب کن:",
@@ -199,6 +205,8 @@ async def tg_cancel_cb(event):
         except Exception:
             pass
     _state.pop(uid, None)
+    if _rubika_state is not None:
+        _rubika_state.pop(uid, None)
     await _respond(event, "لغو شد.", buttons=_menu())
 
 
@@ -819,6 +827,10 @@ async def _msg_router(event):
     st = _state.get(uid)
     if not st:
         return  # not in a Telegram flow -> ignore (Rubika router handles its own)
+    # If a Rubika flow also owns this user (shouldn't happen, but be safe),
+    # defer to the Rubika router so the message is handled exactly once.
+    if _rubika_state is not None and _rubika_state.get(uid):
+        return
     if db.maintenance_on():
         await event.respond("🛠 ربات در حال تعمیر است.")
         return
@@ -840,11 +852,14 @@ async def _msg_router(event):
 # --------------------------------------------------------------------------- #
 # Wiring
 # --------------------------------------------------------------------------- #
-def setup(shared_bot):
+def setup(shared_bot, rubika_state=None):
     """Register all Telegram-section handlers on the shared bot and start the
-    sequential send worker. Called once from customer_bot.amain()."""
-    global bot, TelegramClient, _send_queue
+    sequential send worker. Called once from customer_bot.amain().
+    rubika_state is customer_bot's conversation-state dict (for cross-section
+    mutual exclusion)."""
+    global bot, TelegramClient, _send_queue, _rubika_state
     bot = shared_bot
+    _rubika_state = rubika_state
     from telethon import TelegramClient as _TC
     TelegramClient = _TC
     _send_queue = asyncio.Queue()
