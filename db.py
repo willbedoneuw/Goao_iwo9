@@ -656,18 +656,21 @@ def add_balance(telegram_id: int, amount: float):
 
 
 def deduct_balance(telegram_id: int, amount: float) -> bool:
-    """Deduct amount from the customer's balance. Returns False if insufficient."""
+    """Atomically deduct amount from the customer's balance.
+
+    Uses a single UPDATE with a WHERE balance >= ? guard to prevent TOCTOU race
+    conditions.  Returns False if balance is insufficient or user not found.
+    """
     conn = _conn()
-    row = conn.execute("SELECT balance FROM customers WHERE telegram_id = ?",
-                       (int(telegram_id),)).fetchone()
-    if not row or float(row["balance"]) < float(amount):
-        conn.close()
-        return False
-    conn.execute("UPDATE customers SET balance = balance - ? WHERE telegram_id = ?",
-                 (float(amount), int(telegram_id)))
+    cur = conn.execute(
+        "UPDATE customers SET balance = balance - ? "
+        "WHERE telegram_id = ? AND balance >= ?",
+        (float(amount), int(telegram_id), float(amount)),
+    )
     conn.commit()
+    success = cur.rowcount == 1
     conn.close()
-    return True
+    return success
 
 
 # =========================================================================== #

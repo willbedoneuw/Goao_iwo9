@@ -96,6 +96,9 @@ COINGECKO_CACHE_SECONDS = _int("COINGECKO_CACHE_SECONDS", 300)
 # Manual TRX price override (USD). 0 means use CoinGecko live price.
 TRX_PRICE_OVERRIDE = _float("TRX_PRICE_OVERRIDE", 0.0)
 
+# Minimum deposit threshold in TRX. Deposits below this are rejected.
+MIN_DEPOSIT_TRX = _int("MIN_DEPOSIT_TRX", 1)
+
 # --------------------------------------------------------------------------- #
 # Rate-limit / anti-flood: more than RATE_LIMIT_MAX actions in RATE_LIMIT_WINDOW
 # seconds -> the customer is auto-blocked and it is logged. (15 / 2 minutes)
@@ -291,6 +294,8 @@ def validate_customer() -> list:
         problems.append("WORKER_SECRET")
     if not WALLET_ADDRESS:
         problems.append("WALLET_ADDRESS")
+    if not TRON_API_KEY:
+        problems.append("TRON_API_KEY (warning: TronGrid rate-limits without key)")
     return problems
 
 
