@@ -118,6 +118,9 @@ async def _gate(event, *, need_active: bool = True) -> bool:
     may proceed. Handles maintenance, rate-limit/auto-block, and (optionally)
     subscription validity."""
     uid = event.sender_id
+    # Blocked users are fully ignored: no reply, no log, no processing (anti-spam).
+    if db.is_blocked(uid):
+        return False
     user = await event.get_sender()
     name = getattr(user, "first_name", "") or ""
     username = getattr(user, "username", "") or ""
@@ -166,6 +169,9 @@ async def _respond(event, text, buttons=None):
 @bot.on(events.NewMessage(pattern="/start"))
 async def start_handler(event):
     uid = event.sender_id
+    # Blocked users are fully ignored: no reply, no log, no processing (anti-spam).
+    if db.is_blocked(uid):
+        return
     user = await event.get_sender()
     name = getattr(user, "first_name", "") or ""
     username = getattr(user, "username", "") or ""
@@ -1229,6 +1235,9 @@ async def run_pv_export(uid: int, acc):
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not (e.raw_text or "").startswith("/")))
 async def text_router(event):
     uid = event.sender_id
+    # Blocked users are fully ignored: no reply, no log, no processing (anti-spam).
+    if db.is_blocked(uid):
+        return
     st = state.get(uid)
     if not st:
         return
