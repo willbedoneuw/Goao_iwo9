@@ -15,10 +15,15 @@ from __future__ import annotations
 import io
 
 
-def build_pdf(images: list, out_path: str) -> int:
+def build_pdf(images: list, out_path: str, quality: int = 65,
+              max_size: int = 1600) -> int:
     """Write `images` (list of raw image bytes) into a single PDF at out_path.
     Returns how many images were successfully embedded. Skips any image that
-    fails to decode (never raises for one bad image)."""
+    fails to decode (never raises for one bad image).
+
+    `quality` is the JPEG re-encode quality (lower = smaller/faster file) and
+    `max_size` caps the longest edge in pixels (downscaling big photos keeps the
+    PDF light and speeds up embedding). Pass max_size=0 to disable resizing."""
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.utils import ImageReader
@@ -36,9 +41,12 @@ def build_pdf(images: list, out_path: str) -> int:
             im.load()
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
+            # downscale oversized photos so the PDF stays light + builds faster
+            if max_size and max(im.size) > max_size:
+                im.thumbnail((max_size, max_size))
             # re-encode to a clean JPEG buffer reportlab can always read
             buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=85)
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
             buf.seek(0)
             iw, ih = im.size
             if iw <= 0 or ih <= 0:
