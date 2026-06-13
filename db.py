@@ -195,6 +195,39 @@ def init():
         """
     )
 
+    # ---- TELEGRAM section (independent of the Rubika `accounts` table) ----
+    # Each customer's Telegram USER accounts (StringSession stored here).
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_accounts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER,
+            phone       TEXT,
+            name        TEXT,
+            username    TEXT,
+            user_id     TEXT,
+            session     TEXT,
+            label       TEXT DEFAULT '',
+            added_at    TEXT,
+            status      TEXT DEFAULT 'active'
+        )
+        """
+    )
+    # Per-customer Telegram content + send settings.
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_settings (
+            customer_id  INTEGER PRIMARY KEY,
+            content_type TEXT,
+            content_text TEXT,
+            media_path   TEXT,
+            send_delay   REAL,
+            target_mode  TEXT DEFAULT 'both',
+            total_sends  INTEGER DEFAULT 0
+        )
+        """
+    )
+
     # ---- Add balance column to customers if not present ----
     try:
         c.execute("ALTER TABLE customers ADD COLUMN balance REAL DEFAULT 0")
@@ -959,3 +992,177 @@ def maintenance_on() -> bool:
     here so it never needs to touch the owner-only central database."""
     path = os.path.join(os.path.dirname(DB_PATH), "maintenance.flag")
     return os.path.exists(path)
+
+
+
+# =========================================================================== #
+# TELEGRAM section helpers (separate tables; fully decoupled from Rubika).
+# =========================================================================== #
+def add_tg_account(customer_id: int, phone: str, name: str, username: str,
+                   user_id: str, session: str) -> int:
+    """Insert or update (per customer + phone) a Telegram user account."""
+    conn = _conn()
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT id FROM tg_accounts WHERE customer_id = ? AND phone = ?",
+        (int(customer_id), phone),
+    ).fetchone()
+    if row:
+        c.execute(
+            "UPDATE tg_accounts SET name = ?, username = ?, user_id = ?, "
+            "session = ?, status = 'active' WHERE id = ?",
+            (name, username, str(user_id), session, int(row["id"])),
+        )
+        aid = int(row["id"])
+    else:
+        c.execute(
+            "INSERT INTO tg_accounts (customer_id, phone, name, username, "
+            "user_id, session, added_at, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'active')",
+            (int(customer_id), phone, name, username, str(user_id), session, _now()),
+        )
+        aid = int(c.lastrowid)
+    conn.commit()
+    conn.close()
+    return aid
+
+
+def list_tg_accounts(customer_id: int = None) -> list:
+    conn = _conn()
+    if customer_id is None:
+        rows = conn.execute("SELECT * FROM tg_accounts ORDER BY id").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM tg_accounts WHERE customer_id = ? ORDER BY id",
+            (int(customer_id),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_tg_account(account_id: int):
+    conn = _conn()
+    row = conn.execute("SELECT * FROM tg_accounts WHERE id = ?",
+                       (int(account_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_tg_account_owned(account_id: int, customer_id: int):
+    conn = _conn()
+    row = conn.execute(
+        "SELECT * FROM tg_accounts WHERE id = ? AND customer_id = ?",
+        (int(account_id), int(customer_id))).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_tg_account(account_id: int):
+    conn = _conn()
+    conn.execute("DELETE FROM tg_accounts WHERE id = ?", (int(account_id),))
+    conn.commit()
+    conn.close()
+
+
+def set_tg_status(account_id: int, status: str):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET status = ? WHERE id = ?",
+                 (status, int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_tg_label(account_id: int, label: str):
+    conn = _conn()
+    conn.execute("UPDATE tg_accounts SET label = ? WHERE id = ?",
+                 ((label or "").strip()[:40], int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def count_tg_accounts() -> int:
+    conn = _conn()
+    row = conn.execute("SELECT COUNT(*) AS n FROM tg_accounts").fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def count_customer_tg_accounts(customer_id: int) -> int:
+    conn = _conn()
+    row = conn.execute("SELECT COUNT(*) AS n FROM tg_accounts WHERE customer_id = ?",
+                       (int(customer_id),)).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def _ensure_tg_settings(c, customer_id: int):
+    c.execute(
+        "INSERT OR IGNORE INTO tg_settings (customer_id, content_type, "
+        "content_text, media_path, send_delay, target_mode, total_sends) "
+        "VALUES (?, NULL, NULL, NULL, ?, 'both', 0)",
+        (int(customer_id), config.TG_SEND_DELAY),
+    )
+
+
+def get_tg_settings(customer_id: int) -> dict:
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_tg_settings(c, customer_id)
+    conn.commit()
+    row = c.execute("SELECT * FROM tg_settings WHERE customer_id = ?",
+                    (int(customer_id),)).fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return {"customer_id": int(customer_id), "content_type": None,
+            "content_text": None, "media_path": None,
+            "send_delay": config.TG_SEND_DELAY, "target_mode": "both",
+            "total_sends": 0}
+
+
+def set_tg_content(customer_id: int, content_type, content_text, media_path):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_tg_settings(c, customer_id)
+    c.execute(
+        "UPDATE tg_settings SET content_type = ?, content_text = ?, "
+        "media_path = ? WHERE customer_id = ?",
+        (content_type, content_text, media_path, int(customer_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_tg_delay(customer_id: int) -> float:
+    return config.clamp_tg_delay(get_tg_settings(customer_id).get("send_delay"))
+
+
+def set_tg_delay(customer_id: int, value: float):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_tg_settings(c, customer_id)
+    c.execute("UPDATE tg_settings SET send_delay = ? WHERE customer_id = ?",
+              (config.clamp_tg_delay(value), int(customer_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_tg_target_mode(customer_id: int, mode: str):
+    if mode not in ("both", "contacts", "groups"):
+        mode = "both"
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_tg_settings(c, customer_id)
+    c.execute("UPDATE tg_settings SET target_mode = ? WHERE customer_id = ?",
+              (mode, int(customer_id)))
+    conn.commit()
+    conn.close()
+
+
+def incr_tg_sends(customer_id: int, n: int = 1):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_tg_settings(c, customer_id)
+    c.execute("UPDATE tg_settings SET total_sends = total_sends + ? "
+              "WHERE customer_id = ?", (int(n), int(customer_id)))
+    conn.commit()
+    conn.close()

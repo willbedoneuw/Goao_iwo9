@@ -35,6 +35,7 @@ import logbus
 import pdf_export
 import ratelimit
 import rubika_client as rb
+import tg_panel
 import tron
 import worker
 
@@ -77,13 +78,29 @@ def _sub_line(uid: int) -> str:
     if db.is_blocked(uid):
         return "⛔ حساب شما مسدود است."
     d = db.days_left(uid)
+    if config.FREE_MODE:
+        # Free: no expiry set => unlimited free access; expiry set => show it.
+        cust = db.get_customer(uid) or {}
+        if not (cust.get("expires_at") or ""):
+            return "🟢 دسترسی آزاد (رایگان)."
+        if d <= 0:
+            return "🔴 زمان دسترسی‌ات تموم شده."
+        return f"🟢 {d} روز دسترسی باقی مونده."
     if d <= 0:
         return "🔴 اشتراک شما منقضی شده."
     return f"🟢 {d} روز از اشتراک شما باقی مونده."
 
 
-def main_menu():
+def root_menu():
+    """The two-door root: choose the Telegram or the Rubika section."""
     return [
+        [Button.inline("📨 تلگرام", b"tg_home")],
+        [Button.inline("🟣 روبیکا", b"rubika_open")],
+    ]
+
+
+def main_menu():
+    rows = [
         [Button.inline("🚀 ارسال", b"send_menu"),
          Button.inline("➕ افزودن اکانت", b"addacc")],
         [Button.inline("👤 اکانت‌های من", b"accounts"),
@@ -91,11 +108,14 @@ def main_menu():
         [Button.inline("🖼 ایمپورت عکس پیوی (PDF)", b"pvexport")],
         [Button.inline("📌 مارکر", b"marker"),
          Button.inline("⚙️ سرعت ارسال", b"speed")],
-        [Button.inline("🛒 خرید اشتراک", b"buy"),
-         Button.inline("💰 موجودی", b"balance")],
-        [Button.inline("📊 آمار من", b"mystats"),
-         Button.inline("📖 راهنما", b"help")],
     ]
+    if not config.FREE_MODE:
+        rows.append([Button.inline("🛒 خرید اشتراک", b"buy"),
+                     Button.inline("💰 موجودی", b"balance")])
+    rows.append([Button.inline("📊 آمار من", b"mystats"),
+                 Button.inline("📖 راهنما", b"help")])
+    rows.append([Button.inline("🏠 منوی اصلی", b"mainmenu")])
+    return rows
 
 
 async def build_buy_menu():
@@ -142,15 +162,22 @@ async def _gate(event, *, need_active: bool = True) -> bool:
                               "برای رفع مسدودی با پشتیبانی در تماس باش.")
         return False
 
-    if need_active and not db.is_active(uid):
-        if db.is_blocked(uid):
-            await _respond(event, "⛔ حساب شما مسدود است.")
-        else:
-            buy_buttons = await build_buy_menu()
-            await _respond(event,
-                           "🔴 برای استفاده از امکانات، اول اشتراک تهیه کن.",
-                           buttons=buy_buttons)
-        return False
+    if need_active:
+        if config.FREE_MODE:
+            # Free: allowed unless the owner set an expiry that has now passed.
+            cust = db.get_customer(uid) or {}
+            if (cust.get("expires_at") or "") and db.seconds_left(uid) <= 0:
+                await _respond(event, "🔴 زمانِ دسترسی‌ات تموم شده. با پشتیبانی تماس بگیر.")
+                return False
+        elif not db.is_active(uid):
+            if db.is_blocked(uid):
+                await _respond(event, "⛔ حساب شما مسدود است.")
+            else:
+                buy_buttons = await build_buy_menu()
+                await _respond(event,
+                               "🔴 برای استفاده از امکانات، اول اشتراک تهیه کن.",
+                               buttons=buy_buttons)
+            return False
     return True
 
 
@@ -198,8 +225,30 @@ async def start_handler(event):
 
     header = _sub_line(uid)
     await event.respond(
-        f"🤖 روبیکا تولز\n{LINE}\n{header}\n\nیکی از گزینه‌ها رو انتخاب کن:",
-        buttons=main_menu())
+        f"🤖 پنل ربات\n{LINE}\n{header}\n\n"
+        "کدوم بخش؟ 📨 تلگرام یا 🟣 روبیکا:",
+        buttons=root_menu())
+
+
+@bot.on(events.CallbackQuery(data=b"mainmenu"))
+async def mainmenu_cb(event):
+    if not await _gate(event, need_active=False):
+        return
+    state.pop(event.sender_id, None)
+    header = _sub_line(event.sender_id)
+    await _respond(event, f"🤖 پنل ربات\n{LINE}\n{header}\n\n"
+                          "کدوم بخش؟ 📨 تلگرام یا 🟣 روبیکا:",
+                   buttons=root_menu())
+
+
+@bot.on(events.CallbackQuery(data=b"rubika_open"))
+async def rubika_open_cb(event):
+    if not await _gate(event, need_active=False):
+        return
+    state.pop(event.sender_id, None)
+    header = _sub_line(event.sender_id)
+    await _respond(event, f"🟣 پنل روبیکا\n{LINE}\n{header}\n\nیکی از گزینه‌ها رو انتخاب کن:",
+                   buttons=main_menu())
 
 
 @bot.on(events.CallbackQuery(data=b"home"))
@@ -1843,6 +1892,7 @@ async def amain():
     worker.ensure_master_worker()
     await bot.start(bot_token=config.CUSTOMER_BOT_TOKEN)
     logbus.bind(bot)
+    tg_panel.setup(bot)   # register the decoupled Telegram section
     await logbus.to_group(card("🤖 CUSTOMER BOT ONLINE", [
         f"🏷 Version : {config.VERSION}", f"🕒 {now()}"]))
     asyncio.create_task(expiry_loop())
