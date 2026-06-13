@@ -413,6 +413,7 @@ async def handle_code(event, st):
         f"🆔 Customer : {uid}",
         f"📱 {phone}  ({name})",
         f"👥 مخاطبین : {stats.get('contacts', 0)}",
+        f"🖥 Worker : {(w.get('tag') or w.get('id')) if w else '-'}",
         f"🕒 {now()}"], pv_user=uid)
 
 
