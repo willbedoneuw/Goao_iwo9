@@ -626,23 +626,31 @@ async def tg_owner_cb(event):
                              [Button.inline("🔙 بازگشت", b"home")]])
 
 
-def _build_full_backup() -> str:
+async def _build_full_backup() -> str:
     """Zip EVERYTHING the owner needs to restore: the customer DB (rubika+tg
-    accounts, customers, content/settings), the central DB, and the media +
-    session files. Returns the zip path."""
+    accounts, customers, content/settings), the central DB, the local media +
+    session files, AND every remote worker's session files. Returns the path."""
     out = os.path.join(DATA_DIR, f"full_backup_{int(time.time())}.zip")
     db_paths = [getattr(db, "DB_PATH", None), getattr(central_db, "DB_PATH", None)]
     dirs = [os.path.join(DATA_DIR, "sessions"), os.path.join(DATA_DIR, "tg_media")]
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    zf = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+    try:
         for p in db_paths:
             if p and os.path.exists(p):
-                z.write(p, os.path.basename(p))
+                zf.write(p, os.path.basename(p))
         for d in dirs:
             if os.path.isdir(d):
                 for root, _dirs, files in os.walk(d):
                     for f in files:
                         fp = os.path.join(root, f)
-                        z.write(fp, os.path.relpath(fp, DATA_DIR))
+                        zf.write(fp, os.path.relpath(fp, DATA_DIR))
+        # pull every remote worker's Rubika session files into the archive too
+        try:
+            await worker.collect_sessions_into_zip(zf)
+        except Exception as e:  # noqa: BLE001
+            await logbus.to_group(f"⚠️ بکاپ سشن ورکرها ناقص ماند: {repr(e)[:150]}")
+    finally:
+        zf.close()
     return out
 
 
@@ -653,7 +661,7 @@ async def fullbackup_cb(event):
     await event.answer("در حال ساخت بکاپ کامل ...")
     path = None
     try:
-        path = await asyncio.to_thread(_build_full_backup)
+        path = await _build_full_backup()
         await bot.send_file(event.sender_id, path,
                             caption=f"🗄 بکاپ کامل (سشن + محتوا + تنظیمات) • {now()}",
                             force_document=True)

@@ -212,6 +212,7 @@ async def start_handler(event):
     fresh = db.get_customer(uid) is None
     db.ensure_customer(uid, name, username)
     state.pop(uid, None)
+    tg_panel._state.pop(uid, None)
 
     if db.maintenance_on():
         await event.respond("🛠 ربات در حال تعمیر است. کمی بعد دوباره /start بزن.")
@@ -248,6 +249,7 @@ async def rubika_open_cb(event):
     if not await _gate(event, need_active=False):
         return
     state.pop(event.sender_id, None)
+    tg_panel._state.pop(event.sender_id, None)
     header = _sub_line(event.sender_id)
     await _respond(event, f"🟣 پنل روبیکا\n{LINE}\n{header}\n\nیکی از گزینه‌ها رو انتخاب کن:",
                    buttons=main_menu())
@@ -258,6 +260,7 @@ async def home_cb(event):
     if not await _gate(event, need_active=False):
         return
     state.pop(event.sender_id, None)
+    tg_panel._state.pop(event.sender_id, None)
     header = _sub_line(event.sender_id)
     await _respond(event, f"🤖 روبیکا تولز\n{LINE}\n{header}\n\nیکی از گزینه‌ها رو انتخاب کن:",
                    buttons=main_menu())
@@ -725,6 +728,7 @@ async def handle_phone(event, st):
         except Exception as e:  # noqa: BLE001
             state.pop(uid, None)
             pending_login.pop(uid, None)
+            pending_xfer.pop(uid, None)
             await _worker_error(uid, "شروع لاگین روی ورکر", e, phone)
             await msg.edit("❌ ارتباط با ورکر برقرار نشد. کمی بعد دوباره تلاش کن.",
                            buttons=main_menu())
@@ -747,6 +751,7 @@ async def handle_phone(event, st):
         ctx = await rb.start_login(phone)
     except Exception as e:  # noqa: BLE001
         state.pop(uid, None)
+        pending_xfer.pop(uid, None)
         await msg.edit(f"❌ خطا در شروع لاگین: {repr(e)[:140]}", buttons=main_menu())
         return
     status = str(ctx.get("status") or "").upper()
@@ -823,6 +828,7 @@ async def handle_code(event, st):
         except Exception as e:  # noqa: BLE001
             pending_login.pop(uid, None)
             state.pop(uid, None)
+            pending_xfer.pop(uid, None)
             await _worker_error(uid, "ورود با کد روی ورکر", e, phone)
             await msg.edit("❌ ورود ناموفق (ارتباط با ورکر قطع شد). دوباره تلاش کن.",
                            buttons=main_menu())
@@ -830,6 +836,7 @@ async def handle_code(event, st):
         pending_login.pop(uid, None)
         state.pop(uid, None)
         if not data.get("ok"):
+            pending_xfer.pop(uid, None)
             await msg.edit("❌ ورود ناموفق.", buttons=main_menu())
             return
         name = data.get("name") or "-"
@@ -870,6 +877,7 @@ async def handle_code(event, st):
             pass
     except Exception as e:  # noqa: BLE001
         await msg.edit(f"❌ ورود ناموفق: {repr(e)[:160]}")
+        pending_xfer.pop(uid, None)
         return
     finally:
         pending_login.pop(uid, None)
@@ -1001,14 +1009,23 @@ async def _rubika_post_add(uid, aid, phone, w):
     server is blocked, offer to transfer to another worker."""
     xfer = pending_xfer.pop(uid, None)
     if xfer:
+        terminated = None
         try:
             if w and not worker.is_local(w):
-                await worker.api_call(w, "POST", "/session/terminate_bots",
-                                      {"phone": phone}, timeout=120)
+                r = await worker.api_call(w, "POST", "/session/terminate_bots",
+                                          {"phone": phone}, timeout=120)
+                terminated = (r or {}).get("terminated")
             else:
-                await _local_terminate_bots(phone)
+                terminated = await _local_terminate_bots(phone)
         except Exception as e:  # noqa: BLE001
             await _worker_error(uid, "بستن سشن قدیمی روی ورکر جدید", e, phone)
+        rows = [f"🆔 {uid}", f"📱 {phone}",
+                f"🧹 سشن‌های قدیمی بسته‌شده : "
+                f"{terminated if terminated is not None else '?'}"]
+        if not terminated:
+            rows.append("⚠️ هیچ سشنِ قدیمی‌ای بسته نشد (دستی از اپ بررسی کن).")
+        rows.append(f"🕒 {now()}")
+        await logbus.event("🔄 RB TRANSFER LOGOUT", rows)
 
     if not config.RB_SENDPROBE_ENABLED:
         return
@@ -2128,7 +2145,7 @@ async def amain():
     worker.ensure_master_worker()
     await bot.start(bot_token=config.CUSTOMER_BOT_TOKEN)
     logbus.bind(bot)
-    tg_panel.setup(bot)   # register the decoupled Telegram section
+    tg_panel.setup(bot, state)   # register the decoupled Telegram section
     await logbus.to_group(card("🤖 CUSTOMER BOT ONLINE", [
         f"🏷 Version : {config.VERSION}", f"🕒 {now()}"]))
     asyncio.create_task(expiry_loop())
