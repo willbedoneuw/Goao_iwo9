@@ -27,15 +27,19 @@ IMPORTANT
   test messages afterwards. Set TEST_TARGET=contacts for a real-world test.
 * Run it when no real send is in progress for that account (shared session).
 
-Configure via environment variables:
+Configure via environment variables (all optional except TEST_PHONE):
   TEST_PHONE        (required) account phone, e.g. 989131528613
   TEST_TARGET       self (default) | contacts
-  TEST_COUNT        how many forwards to attempt (default 30)
-  TEST_DELAY        seconds between forwards (default = config.DEFAULT_DELAY)
+  TEST_COUNT        forwards in the single run (default 30)
+  TEST_DELAY        seconds between forwards in the single run (default = config.DEFAULT_DELAY)
   TEST_MARKER       marker text (default = config.FORWARD_MARKER)
-  TEST_SWEEP        0 (default) | 1  -> run the delay sweep instead
+  TEST_SINGLE       1 (default) | 0  -> skip the single run
+  TEST_SWEEP        1 (default) | 0  -> skip the delay sweep
   TEST_SWEEP_DELAYS comma list (default "0.5,1,2,3,5")
   TEST_SWEEP_BATCH  forwards per delay in the sweep (default 8)
+
+ONE command runs the WHOLE battery (IP+geo, connect, marker, stats, single
+run, AND the delay sweep). Just: TEST_PHONE=... python3 diagnose_send.py
 """
 import asyncio
 import os
@@ -166,7 +170,9 @@ async def main():
     count = int(_env("TEST_COUNT", "30"))
     delay = float(_env("TEST_DELAY", str(config.DEFAULT_DELAY)))
     marker = _env("TEST_MARKER", config.FORWARD_MARKER)
-    sweep = _env("TEST_SWEEP", "0") == "1"
+    # one command runs the FULL battery by default; set these to 0 to skip a part
+    run_single = _env("TEST_SINGLE", "1") != "0"
+    run_sweep = _env("TEST_SWEEP", "1") != "0"
 
     print("=" * 60)
     print("  SEND DIAGNOSTIC  (هیچ‌چیزی از برنامه عوض نمی‌شه)")
@@ -205,59 +211,74 @@ async def main():
             print("⚠️ حالت contacts: این ارسالِ واقعی به مخاطب‌های واقعیه!")
         else:
             # SAFE default: forward the marked message back to OWN Saved Messages
-            targets_all = [saved_guid]  # repeated below
+            targets_all = [saved_guid]
 
-        if sweep:
+        # ============ PART 1: single controlled run ============
+        single_res = None
+        if run_single:
+            print("\n" + "█" * 60)
+            print("  بخش ۱: تستِ ارسالِ پشت‌سرهم (single run)")
+            print("█" * 60)
+            if target_mode == "contacts":
+                targets = targets_all[:count]
+            else:
+                targets = [saved_guid] * count
+            single_res = await do_forwards(client, saved_guid, mid, targets,
+                                           delay, label="run")
+
+        # ============ PART 2: delay sweep ============
+        sweep_results = None
+        delays = []
+        if run_sweep:
+            print("\n" + "█" * 60)
+            print("  بخش ۲: SWEEP تاخیرها (کدوم تاخیر throttle نمی‌خوره)")
+            print("█" * 60)
+            # cool down a bit so PART 1 throttling doesn't bleed into the sweep
+            print("  (۱۰ ثانیه استراحت قبل از sweep تا اثر بخش ۱ خنثی شه...)")
+            await asyncio.sleep(10)
             delays = [float(x) for x in
                       (_env("TEST_SWEEP_DELAYS", "0.5,1,2,3,5")).split(",")]
             batch = int(_env("TEST_SWEEP_BATCH", "8"))
-            print(f"\n🧪 حالت SWEEP: برای هر تاخیر {batch} ارسال — تا ببینیم کدوم "
-                  f"تاخیر throttle نمی‌خوره.")
-            results = {}
+            sweep_results = {}
             for d in delays:
                 if target_mode == "contacts":
                     tg = targets_all[:batch]
                 else:
                     tg = [saved_guid] * batch
-                results[d] = await do_forwards(client, saved_guid, mid, tg, d,
-                                               label=f"delay={d}s")
-                # small cooldown between sweeps so one doesn't bleed into next
+                sweep_results[d] = await do_forwards(client, saved_guid, mid, tg,
+                                                     d, label=f"delay={d}s")
                 await asyncio.sleep(3)
-            print("\n📊 خلاصهٔ SWEEP:")
-            _line()
-            for d in delays:
-                r = results[d]
-                verdict = "خوب ✅" if r["too"] == 0 else f"throttle از #{r['first_too_at']} 🚫"
-                print(f"  delay={d:>4}s -> ✅{r['ok']}/{r['n']}  TOO_REQ={r['too']}  {verdict}")
-            _line()
-            good = [d for d in delays if results[d]["too"] == 0]
-            if good:
-                print(f"✅ پیشنهاد: با تاخیر ≥ {min(good)}s تو این تست throttle نخورد.")
-            else:
-                print("⚠️ تو همهٔ تاخیرها throttle خورد — به‌احتمال زیاد مشکل از "
-                      "آی‌پی سرور یا محدودیت شدید اکانته، نه از تاخیر.")
-        else:
-            if target_mode == "contacts":
-                targets = targets_all[:count]
-            else:
-                targets = [saved_guid] * count
-            r = await do_forwards(client, saved_guid, mid, targets, delay,
-                                  label="run")
-            print("\n📊 تحلیل:")
+
+        # ============ FINAL REPORT ============
+        print("\n" + "=" * 60)
+        print("  📊 گزارش نهایی")
+        print("=" * 60)
+        if single_res is not None:
+            r = single_res
             if r["too"] == 0 and r["other"] == 0:
-                print(f"  ✅ هر {r['n']} ارسال موفق بود با تاخیر {delay}s — تو این "
-                      "شرایط throttle نخوردی. اگه ارسال واقعی می‌ایسته، احتمالاً "
-                      "تعداد واقعی بیشتره یا اکانت قبلاً throttle شده.")
+                print(f"• single: هر {r['n']} ارسال موفق با تاخیر {delay}s — "
+                      "تو این شرایط throttle نخوردی.")
             elif r["too"]:
-                print(f"  🚫 بعد از {r['first_too_at'] - 1} ارسال موفق، روبیکا "
-                      f"TOO_REQUESTS داد. یعنی سقفِ نرخِ روبیکا حدود همین‌جاست.")
-                print(f"  چون MAX_ERRORS={config.MAX_ERRORS}، تو ارسال واقعی فقط بعد "
-                      f"از {config.MAX_ERRORS} خطا ربات ۵ دقیقه مکث می‌کنه و بعد "
-                      "از چند بار تلاش متوقف می‌شه. برای تستِ تاخیرِ امن: "
-                      "TEST_SWEEP=1 بزن.")
+                done = (r["first_too_at"] - 1) if r["first_too_at"] else 0
+                print(f"• single: بعد از {done} ارسالِ موفق، TOO_REQUESTS اومد. "
+                      f"چون MAX_ERRORS={config.MAX_ERRORS}، تو ارسال واقعی خیلی زود "
+                      "به سقف خطا می‌خوره و مکث/توقف می‌کنه.")
             if r["other"]:
-                print(f"  ❌ {r['other']} خطای غیرِ throttle هم بود — به متن خطاها "
-                      "بالا نگاه کن (مثلاً INVALID_AUTH = سشن پریده).")
+                print(f"• single: {r['other']} خطای غیرِ throttle (به خطاهای بالا "
+                      "نگاه کن، مثلاً INVALID_AUTH = سشن پریده).")
+        if sweep_results is not None:
+            print("• sweep:")
+            for d in delays:
+                rr = sweep_results[d]
+                verdict = "خوب ✅" if rr["too"] == 0 else f"throttle از #{rr['first_too_at']} 🚫"
+                print(f"    delay={d:>4}s -> ✅{rr['ok']}/{rr['n']}  "
+                      f"TOO_REQ={rr['too']}  {verdict}")
+            good = [d for d in delays if sweep_results[d]["too"] == 0]
+            if good:
+                print(f"  ✅ پیشنهاد: با تاخیر ≥ {min(good)}s تو این تست throttle نخورد.")
+            else:
+                print("  ⚠️ تو همهٔ تاخیرها throttle خورد — احتمالاً مشکل از آی‌پی "
+                      "سرور یا محدودیتِ شدیدِ همین اکانته، نه از تاخیر.")
     except Exception as e:  # noqa: BLE001
         print(f"\n💥 خطای کلی در تشخیص: {e!r}")
     finally:
