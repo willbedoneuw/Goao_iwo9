@@ -300,6 +300,10 @@ async def main():
     try:
         client = await connect_account(phone)
 
+        # show recipient stats FIRST so the contact count is ALWAYS visible,
+        # even when there's no message in Saved Messages to test-send.
+        ordered = await show_recipient_stats(client)
+
         # find the marked message in Saved Messages; if none, fall back to the
         # latest Saved Messages message so the rate test can still run.
         print(f"🔎 جستجوی مارکر «{marker}» در Saved Messages ...")
@@ -311,12 +315,10 @@ async def main():
             saved_guid, mid = await _latest_saved_message(client)
             used = "آخرین پیامِ Saved Messages"
         if not mid:
-            print("   ❌ هیچ پیامی توی Saved Messages این اکانت نیست. یه پیام (هرچی) "
-                  "توی Saved Messages بذار و دوباره اجرا کن.")
+            print("   ❌ هیچ پیامی توی Saved Messages این اکانت نیست. (تعدادِ مخاطب "
+                  "بالا ☝️ اومد) برای تستِ ارسال، یه پیام توی Saved Messages بذار.")
             return
         print(f"   ✅ پیامِ تست انتخاب شد: message_id={mid}  (منبع: {used})")
-
-        ordered = await show_recipient_stats(client)
 
         # choose targets
         if target_mode == "contacts":
