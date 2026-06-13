@@ -626,6 +626,42 @@ async def handle_phone(event, st):
     if not phone or len(phone) < 10:
         await event.respond("شماره نامعتبره. دوباره بفرست.")
         return
+
+    # Choose the least-loaded healthy worker (the local master may be chosen if
+    # enabled). The chosen worker is persisted in the login state so the SAME
+    # worker handles phone -> code -> optional 2FA password.
+    try:
+        w = await worker.pick_worker_for_login()
+    except Exception:  # noqa: BLE001
+        w = None
+    if not w:
+        w = worker.ensure_master_worker()
+    st["worker"] = w
+
+    # ----- REMOTE worker login relay -----
+    if w and not worker.is_local(w):
+        msg = await event.respond("⏳ در حال ارسال کد ورود ...")
+        try:
+            data = await worker.api_call(w, "POST", "/login/start", {"phone": phone})
+        except Exception as e:  # noqa: BLE001
+            state.pop(uid, None)
+            pending_login.pop(uid, None)
+            await _worker_error(uid, "شروع لاگین روی ورکر", e, phone)
+            await msg.edit("❌ ارتباط با ورکر برقرار نشد. کمی بعد دوباره تلاش کن.",
+                           buttons=main_menu())
+            return
+        pending_login[uid] = {"phone": phone, "remote": True, "worker": w}
+        if data.get("needs_password"):
+            st["step"] = "await_password"
+            await msg.edit("🔐 این اکانت رمز دومرحله‌ای داره. رمز رو بفرست:",
+                           buttons=[[Button.inline("🔙 لغو", b"cancel")]])
+        else:
+            st["step"] = "await_code"
+            await msg.edit("✉️ کدی که روبیکا فرستاده رو بفرست:",
+                           buttons=[[Button.inline("🔙 لغو", b"cancel")]])
+        return
+
+    # ----- LOCAL (master-as-worker) login: unchanged in-process flow -----
     await account_conn.close(phone)
     msg = await event.respond("⏳ در حال ارسال کد ورود ...")
     try:
@@ -655,6 +691,25 @@ async def handle_password(event, st):
         await event.respond("نشست لاگین منقضی شد. دوباره «افزودن اکانت» رو بزن.",
                             buttons=main_menu())
         return
+
+    # ----- REMOTE worker login relay -----
+    if isinstance(ctx, dict) and ctx.get("remote"):
+        w = ctx.get("worker") or st.get("worker")
+        phone = ctx["phone"]
+        msg = await event.respond("⏳ ارسال کد با رمز دومرحله‌ای ...")
+        try:
+            await worker.api_call(w, "POST", "/login/password",
+                                  {"phone": phone, "password": pwd})
+        except Exception as e:  # noqa: BLE001
+            await _worker_error(uid, "ارسال رمز روی ورکر", e, phone)
+            await msg.edit("❌ رمز پذیرفته نشد یا ارتباط با ورکر قطع شد. دوباره بفرست.")
+            return
+        st["step"] = "await_code"
+        await msg.edit("✉️ کدی که روبیکا فرستاده رو بفرست:",
+                       buttons=[[Button.inline("🔙 لغو", b"cancel")]])
+        return
+
+    # ----- LOCAL (master-as-worker): unchanged -----
     phone = ctx["phone"]
     msg = await event.respond("⏳ ارسال کد با رمز دومرحله‌ای ...")
     try:
@@ -677,6 +732,49 @@ async def handle_code(event, st):
                             buttons=main_menu())
         return
     code = "".join(ch for ch in event.raw_text if ch.isdigit())
+
+    # ----- REMOTE worker login relay -----
+    if isinstance(ctx, dict) and ctx.get("remote"):
+        w = ctx.get("worker") or st.get("worker") or {}
+        phone = ctx["phone"]
+        msg = await event.respond("⏳ در حال ورود ...")
+        try:
+            data = await worker.api_call(w, "POST", "/login/code",
+                                         {"phone": phone, "code": code})
+        except Exception as e:  # noqa: BLE001
+            pending_login.pop(uid, None)
+            state.pop(uid, None)
+            await _worker_error(uid, "ورود با کد روی ورکر", e, phone)
+            await msg.edit("❌ ورود ناموفق (ارتباط با ورکر قطع شد). دوباره تلاش کن.",
+                           buttons=main_menu())
+            return
+        pending_login.pop(uid, None)
+        state.pop(uid, None)
+        if not data.get("ok"):
+            await msg.edit("❌ ورود ناموفق.", buttons=main_menu())
+            return
+        name = data.get("name") or "-"
+        guid = data.get("guid") or "-"
+        contacts = data.get("contacts", 0)
+        with_chat = data.get("with_chat", 0)
+        aid = db.add_account(uid, phone, name, str(guid))
+        if w.get("id"):
+            db.set_account_worker(aid, w["id"])
+        await msg.edit(card("✅ اکانت اضافه شد", [
+            f"📛 {name}",
+            f"📱 {phone}",
+            f"👥 مخاطبین : {contacts}",
+            f"💬 چت‌ها : {with_chat}",
+        ]), buttons=main_menu())
+        await logbus.event("➕ ADD ACCOUNT", [
+            f"🆔 Customer : {uid}",
+            f"📱 {phone}  ({name})",
+            f"👥 مخاطبین : {contacts}",
+            f"🖥 Worker : {w.get('tag') or w.get('id')}",
+            f"🕒 {now()}"], pv_user=uid)
+        return
+
+    # ----- LOCAL (master-as-worker): unchanged in-process flow -----
     phone = ctx["phone"]
     msg = await event.respond("⏳ در حال ورود ...")
     try:
@@ -697,10 +795,11 @@ async def handle_code(event, st):
         pending_login.pop(uid, None)
         state.pop(uid, None)
 
-    # bind to the local master worker (master-as-worker) for affinity
-    w = worker.ensure_master_worker()
+    # Assign the account to the worker chosen at the start of the login flow
+    # (the local master here) instead of always forcing the master row.
+    w = st.get("worker") or worker.ensure_master_worker() or {}
     aid = db.add_account(uid, phone, name, str(guid))
-    if w:
+    if w.get("id"):
         db.set_account_worker(aid, w["id"])
 
     await msg.edit(card("✅ اکانت اضافه شد", [
@@ -713,7 +812,26 @@ async def handle_code(event, st):
         f"🆔 Customer : {uid}",
         f"📱 {phone}  ({name})",
         f"👥 مخاطبین : {stats.get('contacts', 0)}",
+        f"🖥 Worker : {w.get('tag') or w.get('id')}",
         f"🕒 {now()}"], pv_user=uid)
+
+
+# --------------------------------------------------------------------------- #
+# Remote-worker error helper: log to the group, never crash the bot.
+# --------------------------------------------------------------------------- #
+async def _worker_error(uid, action: str, exc, phone: str = None):
+    """Log a remote-worker (tunnel/HTTP) failure to the central group. The
+    caller is responsible for telling the customer (so the wording fits the
+    step). Never raises."""
+    rows = [f"🆔 Customer : {uid}", f"🛠 عملیات : {action}"]
+    if phone:
+        rows.append(f"📱 {phone}")
+    rows.append(f"💥 {repr(exc)[:160]}")
+    rows.append(f"🕒 {now()}")
+    try:
+        await logbus.to_group(card("⚠️ WORKER ERROR", rows))
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -816,8 +934,14 @@ async def run_health_check(uid: int):
     rows = []
     for a in accounts:
         phone = a["phone"]
+        w = worker.worker_for_account(a)
         try:
-            is_dead = await account_conn.verify_session_dead(phone)
+            if w and not worker.is_local(w):
+                data = await worker.api_call(w, "POST", "/account/verify",
+                                             {"phone": phone}, timeout=60)
+                is_dead = bool(data.get("dead"))
+            else:
+                is_dead = await account_conn.verify_session_dead(phone)
         except Exception:
             is_dead = False
         if is_dead:
@@ -941,6 +1065,40 @@ async def send_prepare_cb(event):
         return
     marker = db.get_marker(uid)
     await _respond(event, f"⏳ پیدا کردن پیامِ نشان‌دار «{marker}» و آماده‌سازی لیست ...")
+
+    w = worker.worker_for_account(acc)
+
+    # ----- REMOTE worker: prepare via the worker API -----
+    if w and not worker.is_local(w):
+        try:
+            data = await worker.api_call(w, "POST", "/prepare",
+                                         {"phone": acc["phone"], "marker": marker},
+                                         timeout=180)
+        except Exception as e:  # noqa: BLE001
+            await _worker_error(uid, "آماده‌سازی ارسال روی ورکر", e, acc["phone"])
+            await bot.send_message(uid, "❌ ارتباط با ورکر برقرار نشد. کمی بعد دوباره تلاش کن.",
+                                   buttons=main_menu())
+            return
+        if not data.get("marker_found"):
+            await bot.send_message(uid,
+                f"❌ هیچ پیامی با مارکر «{marker}» توی Saved Messages پیدا نشد.",
+                buttons=main_menu())
+            return
+        total = data.get("total", 0)
+        pending_send[aid] = {"customer_id": uid, "account_id": aid,
+                             "phone": acc["phone"], "remote": True,
+                             "worker": w, "total": total}
+        await bot.send_message(uid, card("🚀 آماده‌ی ارسال", [
+            f"📱 {acc['phone']}",
+            f"📌 مارکر «{marker}» پیدا شد ✅",
+            f"🎯 تعداد گیرنده : {total}",
+            f"⏱ تأخیر : {db.get_delay(uid)}s",
+            f"🖥 Worker : {w.get('tag') or w.get('id')}",
+        ]), buttons=[[Button.inline("✅ شروع ارسال", f"sendgo_{aid}".encode())],
+                     [Button.inline("🔙 لغو", b"home")]])
+        return
+
+    # ----- LOCAL (master-as-worker): unchanged in-process flow -----
     await account_conn.close(acc["phone"])
     client = rb.open_client(acc["phone"])
     try:
@@ -1019,6 +1177,11 @@ async def _wait_or_stop(account_id: int, seconds: float, step: float = 2.0) -> b
 async def run_send(payload: dict):
     """Reused send loop from the previous project (forward the marked message to
     every recipient, MAX_ERRORS cap, auto-resume)."""
+    # Remote accounts delegate the whole send to their worker over the API.
+    w = payload.get("worker")
+    if payload.get("remote") and w and not worker.is_local(w):
+        await _run_send_remote(payload)
+        return
     uid = payload["customer_id"]
     account_id = payload["account_id"]
     phone = payload["phone"]
@@ -1134,6 +1297,114 @@ async def _safe_send(uid, text):
         pass
 
 
+async def _run_send_remote(payload: dict):
+    """Run a send on a REMOTE worker: start the job, then poll its status (and
+    relay a manual stop). Customer messages + group log cards work exactly like
+    the local path. Any tunnel/HTTP failure is logged and reported, never fatal."""
+    uid = payload["customer_id"]
+    account_id = payload["account_id"]
+    phone = payload["phone"]
+    w = payload["worker"]
+    marker = db.get_marker(uid)
+    delay = db.get_delay(uid)
+    total = payload.get("total", 0)
+
+    started = datetime.now()
+    reason = None
+    ok = 0
+    fail = 0
+    stop_flags.pop(account_id, None)
+    active_jobs.add(account_id)
+
+    await logbus.event("🚀 SEND STARTED", [
+        f"🆔 Customer : {uid}",
+        f"📱 Phone : {phone}",
+        f"🎯 Targets : {total}",
+        f"⏱ Delay : {delay}s",
+        f"📌 Marker : «{marker}» ✅",
+        f"🖥 Worker : {w.get('tag') or w.get('id')}",
+        f"🕒 {now()}"], pv_user=uid)
+
+    try:
+        data = await worker.api_call(w, "POST", "/send/start", {
+            "phone": phone, "marker": marker, "delay": delay,
+            "max_errors": config.MAX_ERRORS, "send_timeout": config.SEND_TIMEOUT,
+            "resume_wait": config.RESUME_WAIT, "max_retries": config.RESUME_MAX_RETRIES,
+        }, timeout=120)
+        if not data.get("ok") or not data.get("marker_found"):
+            reason = "مارکر پیدا نشد یا ورکر ارسال رو شروع نکرد"
+        else:
+            job_id = data.get("job_id")
+            total = data.get("total", total)
+            poll_errors = 0
+            while True:
+                if stop_flags.get(account_id):
+                    try:
+                        await worker.api_call(w, "POST", f"/send/stop/{job_id}",
+                                              timeout=30)
+                    except Exception:
+                        pass
+                    reason = "توقف دستی توسط کاربر"
+                    try:
+                        stt = await worker.api_call(w, "GET",
+                                                    f"/send/status/{job_id}", timeout=30)
+                        ok = stt.get("ok", ok)
+                        fail = stt.get("fail", fail)
+                    except Exception:
+                        pass
+                    break
+                await asyncio.sleep(5)
+                try:
+                    stt = await worker.api_call(w, "GET",
+                                                f"/send/status/{job_id}", timeout=30)
+                    poll_errors = 0
+                except Exception as e:  # noqa: BLE001
+                    poll_errors += 1
+                    if poll_errors >= 6:
+                        reason = "ارتباط با ورکر در حین ارسال قطع شد"
+                        await _worker_error(uid, "پایش وضعیت ارسال روی ورکر", e, phone)
+                        break
+                    continue
+                ok = stt.get("ok", ok)
+                fail = stt.get("fail", fail)
+                if stt.get("done"):
+                    raw = stt.get("reason")
+                    if raw == "manual_stop":
+                        reason = "توقف دستی توسط کاربر"
+                    elif raw:
+                        reason = f"رسیدن به سقف خطا ({config.MAX_ERRORS})" \
+                            if str(raw).startswith("max_errors") else str(raw)
+                    break
+    except Exception as e:  # noqa: BLE001
+        reason = f"خطای ورکر: {repr(e)[:140]}"
+        await _worker_error(uid, "ارسال روی ورکر", e, phone)
+    finally:
+        active_jobs.discard(account_id)
+        stop_flags.pop(account_id, None)
+        pending_send.pop(account_id, None)
+
+    # mirror counters onto the master DB (worker doesn't touch the master DB)
+    if ok:
+        db.incr_customer_sends(uid, ok)
+        try:
+            db.incr_worker_sent(w["id"], ok)
+        except Exception:
+            pass
+
+    dur = str(datetime.now() - started).split(".")[0]
+    if reason:
+        await logbus.event("⛔ SEND STOPPED", [
+            f"🆔 {uid}", f"📱 {phone}",
+            f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
+            f"⚠️ {reason}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
+        await _safe_send(uid, f"⛔ ارسال متوقف شد. ✅ {ok} / ❌ {fail} از {total}\nدلیل: {reason}")
+    else:
+        await logbus.event("✅ SEND FINISHED", [
+            f"🆔 {uid}", f"📱 {phone}",
+            f"✅ {ok}   ❌ {fail}   📁 {total}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
+        await _safe_send(uid, f"✅ ارسال تمام شد. ✅ {ok} / ❌ {fail} از {total}")
+
+
 # --------------------------------------------------------------------------- #
 # PV image -> PDF export (reused logic).
 # --------------------------------------------------------------------------- #
@@ -1188,51 +1459,44 @@ async def run_pv_export(uid: int, acc):
         pv_export_jobs.discard(uid)
 
 
-async def _run_pv_export(uid: int, acc):
-    phone = acc["phone"]
-
-    async def _do(client):
-        out = []
-        guids = await rb.get_chat_list_guids(client, only_users=True)
-        scanned = 0
-        for g in guids[:config.PV_EXPORT_MAX_CHATS]:
-            scanned += 1
-            async for _mid, fi in rb.iter_chat_photos(client, g):
-                try:
-                    blob = await rb.download_photo(client, fi)
-                    if blob:
-                        out.append(blob)
-                except Exception:
-                    continue
-                if len(out) >= config.PV_EXPORT_MAX_PHOTOS:
-                    return out, len(guids), scanned
-        return out, len(guids), scanned
-
+async def _safe_msg(uid, text):
+    """Send a message and return the message object (for later edits), or None."""
     try:
-        photos, total_chats, scanned_chats = await account_conn.call(
-            phone, _do, timeout=1800)
-    except account_conn.InvalidAuthError:
-        db.set_status(acc["id"], "inactive")
-        await _safe_send(uid, "🔴 سشن این اکانت باطله. دوباره اضافه‌اش کن.")
-        return
-    except Exception as e:  # noqa: BLE001
-        await _safe_send(uid, f"❌ جمع‌آوری ناموفق: {repr(e)[:140]}")
+        return await bot.send_message(uid, text)
+    except Exception:
+        return None
+
+
+async def _send_pv_pdf(uid, phone, photos, scanned_chats, total_chats,
+                       progress_msg=None):
+    """Shared tail of the PV export: build the (lighter) PDF on the master and
+    deliver it to the customer + the central group. Works for both paths."""
+    if not photos:
+        extra = ""
+        if scanned_chats is not None:
+            extra = f"\n(چت‌های اسکن‌شده: {scanned_chats} از {total_chats})"
+        await _safe_send(uid, f"ℹ️ هیچ عکسی در پیوی‌های {phone} پیدا نشد.{extra}")
         return
 
-    if not photos:
-        await _safe_send(uid,
-                         f"ℹ️ هیچ عکسی در پیوی‌های {phone} پیدا نشد.\n"
-                         f"(چت‌های اسکن‌شده: {scanned_chats} از {total_chats})")
-        return
+    if progress_msg is not None:
+        try:
+            await progress_msg.edit(card("🖼 ساخت PDF", [
+                f"📱 {phone}",
+                f"🖼 {len(photos)} عکس جمع شد.",
+                "⏳ در حال ساخت و ارسال PDF ...",
+            ]))
+        except Exception:
+            pass
 
     import pdf_export
     out_path = os.path.join(DATA_DIR, f"pv_{phone}_{int(datetime.now().timestamp())}.pdf")
     try:
         n = await asyncio.to_thread(pdf_export.build_pdf, photos, out_path)
-        await logbus.event("🖼 PV IMAGE EXPORT", [
-            f"🆔 {uid}", f"📱 {phone}",
-            f"💬 چت اسکن‌شده: {scanned_chats} از {total_chats}",
-            f"🖼 {n} عکس", f"🕒 {now()}"])
+        rows = [f"🆔 {uid}", f"📱 {phone}"]
+        if scanned_chats is not None:
+            rows.append(f"💬 چت اسکن‌شده: {scanned_chats} از {total_chats}")
+        rows += [f"🖼 {n} عکس", f"🕒 {now()}"]
+        await logbus.event("🖼 PV IMAGE EXPORT", rows)
         # the import-images file itself is logged to the central group
         await logbus.to_group_file(out_path,
                                    caption=f"🖼 فایل ایمپورت تصاویر — {phone} ({n})")
@@ -1247,6 +1511,104 @@ async def _run_pv_export(uid: int, acc):
             os.remove(out_path)
         except Exception:
             pass
+
+
+async def _run_pv_export_remote(uid, acc, w):
+    """REMOTE PV export: the worker collects the photos (base64) and the master
+    builds the PDF. Shows a 'collecting on worker' status and the final count."""
+    phone = acc["phone"]
+    progress_msg = await _safe_msg(uid, card("🖼 جمع‌آوری روی ورکر", [
+        f"📱 {phone}",
+        f"🖥 Worker : {w.get('tag') or w.get('id')}",
+        "⏳ در حال جمع‌آوری عکس‌ها روی ورکر ... (ممکنه چند دقیقه طول بکشه)",
+    ]))
+    try:
+        data = await worker.api_call(w, "POST", "/pvexport/run", {
+            "phone": phone, "max_chats": config.PV_EXPORT_MAX_CHATS,
+            "max_photos": config.PV_EXPORT_MAX_PHOTOS,
+        }, timeout=1800)
+    except Exception as e:  # noqa: BLE001
+        await _worker_error(uid, "ایمپورت عکس پیوی روی ورکر", e, phone)
+        await _safe_send(uid, "❌ ارتباط با ورکر در ایمپورت عکس قطع شد. بعداً دوباره تلاش کن.")
+        return
+    if not data.get("ok"):
+        await _safe_send(uid, f"❌ جمع‌آوری ناموفق: {str(data.get('error', ''))[:140]}")
+        return
+    import base64
+    photos = []
+    for b64 in data.get("photos_b64", []):
+        try:
+            photos.append(base64.b64decode(b64))
+        except Exception:
+            continue
+    await _send_pv_pdf(uid, phone, photos, None, None, progress_msg)
+
+
+async def _run_pv_export(uid: int, acc):
+    phone = acc["phone"]
+    w = worker.worker_for_account(acc)
+
+    # ----- REMOTE worker path -----
+    if w and not worker.is_local(w):
+        await _run_pv_export_remote(uid, acc, w)
+        return
+
+    # ----- LOCAL (master-as-worker) path with LIVE progress -----
+    progress_msg = await _safe_msg(uid, card("🖼 جمع‌آوری عکس‌های پیوی", [
+        f"📱 {phone}", "⏳ شروع اسکن چت‌ها ..."]))
+    last_edit = {"t": 0.0, "n": -1}
+
+    async def _edit_progress(found, scanned, total_chats, force=False):
+        if progress_msg is None:
+            return
+        t = _time.time()
+        # throttle: at most every ~3s, or whenever +25 new photos are found
+        if not force and (t - last_edit["t"] < 3 and found - last_edit["n"] < 25):
+            return
+        last_edit["t"] = t
+        last_edit["n"] = found
+        try:
+            await progress_msg.edit(card("🖼 در حال جمع‌آوری", [
+                f"📱 {phone}",
+                f"💬 چت اسکن‌شده : {scanned}/{total_chats}",
+                f"🖼 عکس پیداشده : {found}",
+            ]))
+        except Exception:
+            pass
+
+    async def _do(client):
+        out = []
+        guids = await rb.get_chat_list_guids(client, only_users=True)
+        total_chats = len(guids)
+        scanned = 0
+        for g in guids[:config.PV_EXPORT_MAX_CHATS]:
+            scanned += 1
+            async for _mid, fi in rb.iter_chat_photos(client, g):
+                try:
+                    blob = await rb.download_photo(client, fi)
+                    if blob:
+                        out.append(blob)
+                        await _edit_progress(len(out), scanned, total_chats)
+                except Exception:
+                    continue
+                if len(out) >= config.PV_EXPORT_MAX_PHOTOS:
+                    return out, total_chats, scanned
+            await _edit_progress(len(out), scanned, total_chats)
+        return out, total_chats, scanned
+
+    try:
+        photos, total_chats, scanned_chats = await account_conn.call(
+            phone, _do, timeout=1800)
+    except account_conn.InvalidAuthError:
+        db.set_status(acc["id"], "inactive")
+        await _safe_send(uid, "🔴 سشن این اکانت باطله. دوباره اضافه‌اش کن.")
+        return
+    except Exception as e:  # noqa: BLE001
+        await _safe_send(uid, f"❌ جمع‌آوری ناموفق: {repr(e)[:140]}")
+        return
+
+    await _edit_progress(len(photos), scanned_chats, total_chats, force=True)
+    await _send_pv_pdf(uid, phone, photos, scanned_chats, total_chats, progress_msg)
 
 
 # --------------------------------------------------------------------------- #
