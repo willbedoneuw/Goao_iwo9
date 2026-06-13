@@ -1043,9 +1043,16 @@ async def _rubika_post_add(uid, aid, phone, w):
     if res.get("ok") and too == 0 and sent > 0:
         text = card("✅ تستِ ارسال موفق", [
             f"📱 {phone}", f"✅ {sent} ارسالِ موفق",
-            "این سرور برای ارسال سالمه."])
+            "این سرور برای ارسال سالمه.",
+            LINE,
+            f"📌 مارکری که پیدا شد: «{marker}»",
+            "برای ارسالِ انبوه، «🚀 ارسال» رو بزن.",
+        ])
+        buttons = [[Button.inline("🚀 ارسال", b"send_menu")],
+                   [Button.inline("🔙 روبیکا", b"rubika_open")]]
         await logbus.event("✅ RB SEND PROBE OK", [
-            f"🆔 {uid}", f"📱 {phone}", f"✅ {sent}", f"🕒 {now()}"])
+            f"🆔 {uid}", f"📱 {phone}", f"✅ {sent}", f"📌 {marker}",
+            f"🕒 {now()}"])
     elif err == "marker_not_found":
         text = card("🧪 تست انجام نشد", [
             f"📱 {phone}",
