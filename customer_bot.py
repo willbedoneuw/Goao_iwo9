@@ -249,15 +249,19 @@ async def plan_cb(event):
     balance = db.get_balance(uid)
 
     if balance >= trx_needed:
-        # Balance is sufficient -> deduct and credit days immediately
+        # Balance is sufficient -> record payment first, then deduct
+        pseudo_hash = f"balance_{uid}_{int(_time.time())}_{os.urandom(4).hex()}"
+        if not db.record_payment(uid, pseudo_hash, key, float(trx_needed), plan["days"]):
+            await _respond(event, "❌ خطا در ثبت خرید. دوباره تلاش کن.",
+                           buttons=main_menu())
+            return
         ok = db.deduct_balance(uid, trx_needed)
         if not ok:
+            # Payment recorded but balance deduction failed (should not happen
+            # normally since we checked balance above, but handles edge case)
             await _respond(event, "❌ خطا در کسر موجودی. دوباره تلاش کن.",
                            buttons=main_menu())
             return
-        # Record the purchase in payments table for history
-        pseudo_hash = f"balance_purchase_{int(_time.time())}"
-        db.record_payment(uid, pseudo_hash, key, float(trx_needed), plan["days"])
         state.pop(uid, None)
         await _respond(event, card("✅ خرید موفق", [
             f"📦 {plan['title']}",
@@ -308,9 +312,20 @@ async def handle_txhash(event, st):
         return
 
     # fast anti-fraud: reject an already-used hash before hitting the network
-    if db.payment_exists(tx_hash) or not db.record_deposit(uid, tx_hash, 0):
-        # If record_deposit fails, the hash is already used in deposits table
-        # Try payment_exists for the payments table as well
+    if db.payment_exists(tx_hash):
+        state.pop(uid, None)
+        await logbus.event("♻️ پرداخت تکراری", [
+            f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
+            "این هش قبلا استفاده شده.", f"🕒 {now()}"], pv_user=uid)
+        await event.respond("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
+        return
+
+    # Check deposits table for already-used hash (without inserting)
+    conn = db._conn()
+    existing = conn.execute("SELECT 1 FROM deposits WHERE tx_hash = ?",
+                            (str(tx_hash),)).fetchone()
+    conn.close()
+    if existing:
         state.pop(uid, None)
         await logbus.event("♻️ پرداخت تکراری", [
             f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
@@ -323,8 +338,6 @@ async def handle_txhash(event, st):
     # means accept any amount (deposit mode).
     res = await tron.verify_trx_payment(tx_hash, 0)
     if not res.ok:
-        # Remove the preliminary deposit record since verification failed
-        _remove_deposit(uid, tx_hash)
         await msg.edit(f"❌ تایید نشد: {res.reason}",
                        buttons=[[Button.inline("🔁 تلاش دوباره", f"plan_{key}".encode())],
                                 [Button.inline("🏠 منو", b"home")]])
@@ -333,9 +346,21 @@ async def handle_txhash(event, st):
             f"💥 {res.reason}", f"🕒 {now()}"])
         return
 
-    # Deposit verified -> update the deposit record with actual amount and add to balance
+    # Check minimum deposit threshold
     actual_trx = res.amount
-    _update_deposit_amount(uid, tx_hash, actual_trx)
+    if actual_trx < config.MIN_DEPOSIT_TRX:
+        await msg.edit(f"❌ حداقل واریز {config.MIN_DEPOSIT_TRX} TRX است.",
+                       buttons=[[Button.inline("🔁 تلاش دوباره", f"plan_{key}".encode())],
+                                [Button.inline("🏠 منو", b"home")]])
+        return
+
+    # Deposit verified -> record it now (UNIQUE constraint catches race condition)
+    if not db.record_deposit(uid, tx_hash, actual_trx):
+        # Another concurrent request already recorded this hash
+        state.pop(uid, None)
+        await msg.edit("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
+        return
+
     db.add_balance(uid, actual_trx)
 
     await logbus.event("💳 واریز TRX", [
@@ -345,11 +370,14 @@ async def handle_txhash(event, st):
     # Check if balance now covers the plan
     new_balance = db.get_balance(uid)
     if new_balance >= trx_needed:
-        # Auto-purchase
+        # Auto-purchase: record payment first, then deduct balance
+        pseudo_hash = f"balance_{uid}_{int(_time.time())}_{os.urandom(4).hex()}"
+        if not db.record_payment(uid, pseudo_hash, key, float(trx_needed), plan["days"]):
+            state.pop(uid, None)
+            await msg.edit("❌ خطا در ثبت خرید.", buttons=main_menu())
+            return
         ok = db.deduct_balance(uid, trx_needed)
         if ok:
-            pseudo_hash = f"balance_purchase_{int(_time.time())}"
-            db.record_payment(uid, pseudo_hash, key, float(trx_needed), plan["days"])
             state.pop(uid, None)
             await msg.edit(card("✅ واریز و خرید موفق", [
                 f"💰 واریز: {actual_trx:g} TRX",
@@ -374,24 +402,6 @@ async def handle_txhash(event, st):
             LINE,
             "هش تراکنش بعدی رو بفرست یا از منو برگرد.",
         ]), buttons=[[Button.inline("🏠 منو", b"home")]])
-
-
-def _remove_deposit(telegram_id: int, tx_hash: str):
-    """Remove a preliminary deposit record on verification failure."""
-    conn = db._conn()
-    conn.execute("DELETE FROM deposits WHERE customer_id = ? AND tx_hash = ?",
-                 (int(telegram_id), str(tx_hash)))
-    conn.commit()
-    conn.close()
-
-
-def _update_deposit_amount(telegram_id: int, tx_hash: str, trx_amount: float):
-    """Update the deposit record with the actual verified amount."""
-    conn = db._conn()
-    conn.execute("UPDATE deposits SET trx_amount = ? WHERE customer_id = ? AND tx_hash = ?",
-                 (float(trx_amount), int(telegram_id), str(tx_hash)))
-    conn.commit()
-    conn.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -446,8 +456,20 @@ async def handle_deposit_txhash(event, st):
         await event.respond("هشِ تراکنش رو بفرست.")
         return
 
-    # anti-fraud: reject already-used hash
-    if db.payment_exists(tx_hash) or not db.record_deposit(uid, tx_hash, 0):
+    # anti-fraud: reject already-used hash (check without inserting)
+    if db.payment_exists(tx_hash):
+        state.pop(uid, None)
+        await logbus.event("♻️ واریز تکراری", [
+            f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
+            "این هش قبلا استفاده شده.", f"🕒 {now()}"], pv_user=uid)
+        await event.respond("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
+        return
+
+    conn = db._conn()
+    existing = conn.execute("SELECT 1 FROM deposits WHERE tx_hash = ?",
+                            (str(tx_hash),)).fetchone()
+    conn.close()
+    if existing:
         state.pop(uid, None)
         await logbus.event("♻️ واریز تکراری", [
             f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
@@ -458,7 +480,6 @@ async def handle_deposit_txhash(event, st):
     msg = await event.respond("⏳ در حال بررسی تراکنش روی شبکه TRON ...")
     res = await tron.verify_trx_payment(tx_hash, 0)
     if not res.ok:
-        _remove_deposit(uid, tx_hash)
         await msg.edit(f"❌ تایید نشد: {res.reason}",
                        buttons=[[Button.inline("💳 شارژ حساب", b"deposit")],
                                 [Button.inline("🏠 منو", b"home")]])
@@ -467,9 +488,20 @@ async def handle_deposit_txhash(event, st):
             f"💥 {res.reason}", f"🕒 {now()}"])
         return
 
-    # Deposit verified -> update amount and add to balance
+    # Check minimum deposit threshold
     actual_trx = res.amount
-    _update_deposit_amount(uid, tx_hash, actual_trx)
+    if actual_trx < config.MIN_DEPOSIT_TRX:
+        await msg.edit(f"❌ حداقل واریز {config.MIN_DEPOSIT_TRX} TRX است.",
+                       buttons=[[Button.inline("💳 شارژ حساب", b"deposit")],
+                                [Button.inline("🏠 منو", b"home")]])
+        return
+
+    # Deposit verified -> record it now (UNIQUE constraint catches race condition)
+    if not db.record_deposit(uid, tx_hash, actual_trx):
+        state.pop(uid, None)
+        await msg.edit("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
+        return
+
     db.add_balance(uid, actual_trx)
     state.pop(uid, None)
 
