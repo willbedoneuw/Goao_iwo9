@@ -43,7 +43,39 @@ run, AND the delay sweep). Just: TEST_PHONE=... python3 diagnose_send.py
 """
 import asyncio
 import os
+import sys
 import time
+import types
+
+# --------------------------------------------------------------------------- #
+# Make this diagnostic self-sufficient: config.py does `from dotenv import
+# load_dotenv`. If python-dotenv isn't installed for THIS interpreter (e.g. the
+# bot runs in a venv/container), inject a tiny stand-in that parses .env by hand
+# so the script still runs WITHOUT installing anything or touching the app.
+# --------------------------------------------------------------------------- #
+try:
+    import dotenv  # noqa: F401
+except ModuleNotFoundError:
+    def _manual_load_dotenv(path=None, *args, **kwargs):
+        for p in ([path] if path else [".env", os.path.join(os.path.dirname(
+                os.path.abspath(__file__)), ".env")]):
+            try:
+                with open(p) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        os.environ.setdefault(
+                            k.strip(), v.strip().strip('"').strip("'"))
+                return True
+            except FileNotFoundError:
+                continue
+        return False
+    _shim = types.ModuleType("dotenv")
+    _shim.load_dotenv = _manual_load_dotenv
+    sys.modules["dotenv"] = _shim
+    print("ℹ️ python-dotenv نصب نیست؛ .env را دستی لود می‌کنم (اشکالی نداره).")
 
 import config
 import rubika_client as rb
