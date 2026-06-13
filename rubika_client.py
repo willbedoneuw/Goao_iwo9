@@ -334,10 +334,10 @@ async def get_chats_user_guids(client: Client):
 async def get_ordered_recipients(client: Client):
     """Build the recipient list for the account's OWN CONTACTS only.
 
-    Order requested by the user:
-      1) contacts we already have a chat with (most recent first)
-      2) then contacts that are currently online
-      3) then the rest, by last-seen (most recent first)
+    Priority order requested by the user:
+      1) contacts who are ONLINE right now
+      2) then contacts we already have a chat with (most recent activity first)
+      3) then the rest, by last-seen / recent visit (most recent first)
 
     Returns (ordered: list of {guid, name}, stats: dict).
     """
@@ -346,22 +346,37 @@ async def get_ordered_recipients(client: Client):
 
     by_guid = {c["guid"]: c for c in contacts if c["guid"]}
 
-    # 1) contacts with a chat, in recent-activity order
-    with_chat = [g for g in user_chats if g in by_guid]
-    with_chat_set = set(with_chat)
+    online_set = {g for g in by_guid if by_guid[g]["online"]}
 
-    rest = [g for g in by_guid if g not in with_chat_set]
-    # 2) online first, 3) then by last_online desc
-    rest.sort(key=lambda g: (1 if by_guid[g]["online"] else 0, by_guid[g]["last_online"]),
-              reverse=True)
+    # recent-activity order of the chats we have (drives tiers 1 + 2)
+    chat_order = [g for g in user_chats if g in by_guid]
+    chat_rank = {g: i for i, g in enumerate(chat_order)}
 
-    ordered_guids = with_chat + rest
+    def _last(g):
+        return by_guid[g]["last_online"] or 0
+
+    # 1) ONLINE now — within this tier, the ones we chat with come first (by
+    #    recent activity), then the rest of the online ones by most-recent seen.
+    tier1 = sorted(
+        online_set,
+        key=lambda g: (chat_rank.get(g, len(chat_rank)), -_last(g)))
+
+    # 2) NOT online, but we HAVE A CHAT with them (recent activity first)
+    tier2 = [g for g in chat_order if g not in online_set]
+
+    # 3) everyone else, by last-seen / recent visit (most recent first)
+    placed = online_set | set(tier2)
+    tier3 = sorted((g for g in by_guid if g not in placed),
+                   key=lambda g: -_last(g))
+
+    ordered_guids = tier1 + tier2 + tier3
     ordered = [{"guid": g, "name": by_guid[g]["name"]} for g in ordered_guids]
 
     stats = {
         "contacts": len(contacts),
         "groups": n_groups,
-        "with_chat": len(with_chat),
+        "with_chat": len(chat_order),
+        "online": len(online_set),
     }
     return ordered, stats
 
