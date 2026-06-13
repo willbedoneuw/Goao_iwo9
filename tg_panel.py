@@ -518,6 +518,7 @@ async def tg_content_cb(event):
 async def _handle_content(event, st):
     uid = event.sender_id
     msg = event.message
+    cap = (msg.text or "").strip()
     try:
         if msg.photo:
             path = await msg.download_media(file=TG_MEDIA_DIR)
@@ -537,10 +538,19 @@ async def _handle_content(event, st):
         await event.respond(f"❌ خطا در ذخیرهٔ محتوا: {repr(e)[:120]}")
         return
     _state.pop(uid, None)
-    await event.respond(card("✅ محتوا ذخیره شد", [f"{label} به‌عنوان محتوای ارسالی ثبت شد."]),
-                        buttons=_menu())
-    await logbus.event("✍️ TG CONTENT SET", [
-        f"🆔 {uid}", f"📦 {label}", f"🕒 {now()}"], pv_user=uid)
+    # show the customer exactly what was saved
+    confirm = [f"{label} به‌عنوان محتوای ارسالی ثبت شد."]
+    if cap:
+        confirm += [LINE, "📝 متنِ ذخیره‌شده:", cap]
+    await event.respond(card("✅ محتوا ذخیره شد", confirm), buttons=_menu())
+    # log the FULL content (what the user actually set), to group + DM
+    log_rows = [f"🆔 {uid}", f"📦 نوع : {label}"]
+    if cap:
+        log_rows.append(f"📝 متن : {cap[:900]}")
+    else:
+        log_rows.append("📝 متن : (بدون متن/کپشن)")
+    log_rows.append(f"🕒 {now()}")
+    await logbus.event("✍️ TG CONTENT SET", log_rows, pv_user=uid)
 
 
 # --------------------------------------------------------------------------- #
