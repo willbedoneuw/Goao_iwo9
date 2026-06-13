@@ -1443,8 +1443,9 @@ async def pvexport_run_cb(event):
                            alert=True)
         return
     if len(pv_export_jobs) >= config.PV_EXPORT_MAX_CONCURRENT:
-        await event.answer("الان یه ایمپورت دیگه در حال اجراست. چند دقیقه بعد "
-                           "دوباره امتحان کن.", alert=True)
+        await event.answer("📸 ایمپورت تصویر الان در دسترس نیست — یه مشتری دیگه در "
+                           "حال استفاده‌ست. چند دقیقه بعد دوباره امتحان کن.",
+                           alert=True)
         return
     pv_export_jobs.add(uid)
     await _respond(event,
