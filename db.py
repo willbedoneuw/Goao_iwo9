@@ -162,6 +162,45 @@ def init():
     )
     c.execute("INSERT OR IGNORE INTO clock_state (id, last_seen) VALUES (1, 0)")
 
+    # ---- deposits table (TRX deposits with UNIQUE tx_hash) ----
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deposits (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER,
+            tx_hash     TEXT UNIQUE,
+            trx_amount  REAL,
+            created_at  TEXT
+        )
+        """
+    )
+
+    # ---- plan_overrides table (per-plan price override by owner) ----
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS plan_overrides (
+            plan_key TEXT PRIMARY KEY,
+            price    REAL
+        )
+        """
+    )
+
+    # ---- settings table (key-value store for runtime configuration) ----
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+
+    # ---- Add balance column to customers if not present ----
+    try:
+        c.execute("ALTER TABLE customers ADD COLUMN balance REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     conn.commit()
     conn.close()
 
@@ -590,6 +629,163 @@ def rate_hit(customer_id: int) -> tuple:
 def rate_reset(customer_id: int):
     conn = _conn()
     conn.execute("DELETE FROM rate_limit WHERE customer_id = ?", (int(customer_id),))
+    conn.commit()
+    conn.close()
+
+
+# =========================================================================== #
+# Balance management.
+# =========================================================================== #
+def get_balance(telegram_id: int) -> float:
+    """Return the customer's current TRX balance."""
+    conn = _conn()
+    row = conn.execute("SELECT balance FROM customers WHERE telegram_id = ?",
+                       (int(telegram_id),)).fetchone()
+    conn.close()
+    return float(row["balance"]) if row else 0.0
+
+
+def add_balance(telegram_id: int, amount: float):
+    """Add amount to the customer's balance."""
+    ensure_customer(telegram_id)
+    conn = _conn()
+    conn.execute("UPDATE customers SET balance = balance + ? WHERE telegram_id = ?",
+                 (float(amount), int(telegram_id)))
+    conn.commit()
+    conn.close()
+
+
+def deduct_balance(telegram_id: int, amount: float) -> bool:
+    """Deduct amount from the customer's balance. Returns False if insufficient."""
+    conn = _conn()
+    row = conn.execute("SELECT balance FROM customers WHERE telegram_id = ?",
+                       (int(telegram_id),)).fetchone()
+    if not row or float(row["balance"]) < float(amount):
+        conn.close()
+        return False
+    conn.execute("UPDATE customers SET balance = balance - ? WHERE telegram_id = ?",
+                 (float(amount), int(telegram_id)))
+    conn.commit()
+    conn.close()
+    return True
+
+
+# =========================================================================== #
+# Deposits (TRX deposits with unique tx_hash).
+# =========================================================================== #
+def record_deposit(telegram_id: int, tx_hash: str, trx_amount: float) -> bool:
+    """Record a TRX deposit. Returns False if tx_hash already used (anti-fraud)."""
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO deposits (customer_id, tx_hash, trx_amount, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (int(telegram_id), str(tx_hash), float(trx_amount), _now()),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+    conn.commit()
+    conn.close()
+    return True
+
+
+def list_deposits(telegram_id: int) -> list:
+    """List all deposits for a customer."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM deposits WHERE customer_id = ? ORDER BY id DESC",
+        (int(telegram_id),)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# =========================================================================== #
+# Revenue helpers (TRX, based on deposits table).
+# =========================================================================== #
+def today_revenue_trx() -> float:
+    """Total TRX revenue from deposits today."""
+    conn = _conn()
+    today = config.now_dt().strftime("%Y-%m-%d")
+    row = conn.execute(
+        "SELECT COALESCE(SUM(trx_amount), 0) AS s FROM deposits "
+        "WHERE created_at LIKE ?", (f"{today}%",)
+    ).fetchone()
+    conn.close()
+    return float(row["s"]) if row else 0.0
+
+
+def week_revenue_trx() -> float:
+    """Total TRX revenue from deposits in the last 7 days."""
+    conn = _conn()
+    from datetime import datetime, timedelta as td
+    week_ago = (config.now_dt() - td(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    row = conn.execute(
+        "SELECT COALESCE(SUM(trx_amount), 0) AS s FROM deposits "
+        "WHERE created_at >= ?", (week_ago,)
+    ).fetchone()
+    conn.close()
+    return float(row["s"]) if row else 0.0
+
+
+def month_revenue_trx() -> float:
+    """Total TRX revenue from deposits in the last 30 days."""
+    conn = _conn()
+    from datetime import datetime, timedelta as td
+    month_ago = (config.now_dt() - td(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    row = conn.execute(
+        "SELECT COALESCE(SUM(trx_amount), 0) AS s FROM deposits "
+        "WHERE created_at >= ?", (month_ago,)
+    ).fetchone()
+    conn.close()
+    return float(row["s"]) if row else 0.0
+
+
+# =========================================================================== #
+# Plan overrides (owner can change plan prices at runtime).
+# =========================================================================== #
+def get_plan_price(plan_key: str) -> float | None:
+    """Get the overridden price for a plan, or None if not overridden."""
+    conn = _conn()
+    row = conn.execute("SELECT price FROM plan_overrides WHERE plan_key = ?",
+                       (plan_key,)).fetchone()
+    conn.close()
+    return float(row["price"]) if row else None
+
+
+def set_plan_price(plan_key: str, price: float):
+    """Set or update a plan price override."""
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO plan_overrides (plan_key, price) VALUES (?, ?) "
+        "ON CONFLICT(plan_key) DO UPDATE SET price = ?",
+        (plan_key, float(price), float(price)),
+    )
+    conn.commit()
+    conn.close()
+
+
+# =========================================================================== #
+# Settings (generic key-value store for runtime configuration).
+# =========================================================================== #
+def get_setting(key: str, default: str = "") -> str:
+    """Get a setting value by key, or return default if not found."""
+    conn = _conn()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?",
+                       (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    """Set or update a setting."""
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = ?",
+        (key, str(value), str(value)),
+    )
     conn.commit()
     conn.close()
 
