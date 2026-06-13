@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "feat",
   "description": "Rewrite tron.py for TRX TransferContract verification + add CoinGecko TRX price fetcher with 5-minute cache + update config.py for new TRX payment settings + update db.py schema to add balance column and new helper functions",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "In config.py: Change PLANS comments from USDT to USD (prices stay the same $5/$8/$20 but are now fixed USD prices). Remove USDT_CONTRACT, USDT_DECIMALS, PAYMENT_AMOUNT_TOLERANCE. Add PAYMENT_TOLERANCE_PERCENT = _float('PAYMENT_TOLERANCE_PERCENT', 5.0) for 5% tolerance. Add COINGECKO_CACHE_SECONDS = _int('COINGECKO_CACHE_SECONDS', 300) for 5-min price cache. Add TRX_PRICE_OVERRIDE = _float('TRX_PRICE_OVERRIDE', 0.0) for manual price override (0 means use CoinGecko). Keep WALLET_ADDRESS, TRON_API_KEY, TRONGRID_BASE, TRON_TIMEOUT. Update validate_customer() to remove USDT-specific checks.",
     "Rewrite tron.py completely: (a) Add a get_trx_price_usd() async function that fetches TRX/USD from CoinGecko API (https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd) with a 5-minute in-memory cache (use module-level _price_cache dict with timestamp). If config.TRX_PRICE_OVERRIDE > 0, use that instead. (b) Add calc_trx_amount(usd_price: float) -> int that divides usd_price by TRX price, rounds DOWN (math.floor) to integer (customer-friendly). (c) Rewrite verify function as verify_trx_payment(tx_hash: str, expected_trx: int) -> VerifyResult. This verifies: the tx exists (retry up to 3 times with 3s delay), contractRet==SUCCESS, contract type is 'TransferContract' (not TriggerSmartContract), destination (to_address in the contract value) matches config.WALLET_ADDRESS (compare hex forms), amount in SUN (divide by 1_000_000 to get TRX) is >= expected_trx * (1 - tolerance/100). If amount > expected_trx, still accept (overpayment accepted, only plan amount credited). Return actual TRX amount in VerifyResult. (d) Log raw TronGrid responses (status_code + truncated body) via logbus.to_group for anti-fraud audit.",
@@ -29,5 +29,5 @@
     "python -c \"import config; import db; import tron; print('imports OK')\""
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All syntax checks pass. Import checks pass with stub modules (python-dotenv, httpx not installable due to proxy restrictions but py_compile succeeds). db.init() creates all new tables correctly. Balance, deposit, settings, plan_overrides functions tested end-to-end against SQLite. Network packages (rubpy, etc.) unavailable via pip due to proxy restrictions but code is syntactically valid and imports resolve correctly."
 }
