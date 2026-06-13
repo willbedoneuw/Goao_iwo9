@@ -64,8 +64,8 @@ ALLOWED_IDS = [i for i in [OWNER_ID] if i]
 VERSION = os.getenv("VERSION", "V1").strip()
 
 # --------------------------------------------------------------------------- #
-# Subscription plans.  price is in USDT (TRC20).  days is the granted period.
-# 3-day = 5, weekly = 8, monthly = 20.
+# Subscription plans.  price is in USD (fixed).  days is the granted period.
+# 3-day = $5, weekly = $8, monthly = $20.
 # --------------------------------------------------------------------------- #
 PLANS = {
     "3day":   {"title": "اشتراک ۳ روزه", "days": 3,  "price": _float("PRICE_3DAY", 5.0)},
@@ -76,27 +76,28 @@ PLANS = {
 # Warn the customer this many days before expiry.
 EXPIRY_WARN_DAYS = _int("EXPIRY_WARN_DAYS", 2)
 
-# Amount tolerance (USDT) when matching a transaction to a plan price. A tiny
-# tolerance absorbs rounding while still requiring the EXACT plan amount.
-PAYMENT_AMOUNT_TOLERANCE = _float("PAYMENT_AMOUNT_TOLERANCE", 0.01)
+# Payment tolerance (percent). A payment is accepted if actual_trx >=
+# expected_trx * (1 - tolerance/100). Default 5%.
+PAYMENT_TOLERANCE_PERCENT = _float("PAYMENT_TOLERANCE_PERCENT", 5.0)
 
 # --------------------------------------------------------------------------- #
-# TRON / TronGrid — USDT (TRC20) payment verification.
+# TRON / TronGrid — TRX native payment verification.
 # --------------------------------------------------------------------------- #
-# Wallet that customers pay into (your receiving address). TEST default below.
+# Wallet that customers pay into (your receiving address).
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "").strip()
 # TronGrid API key + base url.
 TRON_API_KEY = os.getenv("TRON_API_KEY", "").strip()
 TRONGRID_BASE = os.getenv("TRONGRID_BASE", "https://api.trongrid.io").strip()
-# Official USDT TRC20 contract address.
-USDT_CONTRACT = os.getenv("USDT_CONTRACT",
-                          "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").strip()
-# USDT has 6 decimals on TRON.
-USDT_DECIMALS = _int("USDT_DECIMALS", 6)
 # HTTP timeout (seconds) for TronGrid calls.
 TRON_TIMEOUT = _int("TRON_TIMEOUT", 25)
-# A transaction is accepted only once it has at least this confirmation status.
-# TronGrid returns contractRet == "SUCCESS" for confirmed transfers.
+
+# CoinGecko price cache lifetime (seconds). Default 5 minutes.
+COINGECKO_CACHE_SECONDS = _int("COINGECKO_CACHE_SECONDS", 300)
+# Manual TRX price override (USD). 0 means use CoinGecko live price.
+TRX_PRICE_OVERRIDE = _float("TRX_PRICE_OVERRIDE", 0.0)
+
+# Minimum deposit threshold in TRX. Deposits below this are rejected.
+MIN_DEPOSIT_TRX = _int("MIN_DEPOSIT_TRX", 1)
 
 # --------------------------------------------------------------------------- #
 # Rate-limit / anti-flood: more than RATE_LIMIT_MAX actions in RATE_LIMIT_WINDOW
@@ -151,6 +152,10 @@ CHANNEL_ADD_DELAY = _float("CHANNEL_ADD_DELAY", 2.0)
 # ---- PV image -> PDF export ----
 PV_EXPORT_MAX_CHATS = _int("PV_EXPORT_MAX_CHATS", 1000)
 PV_EXPORT_MAX_PHOTOS = _int("PV_EXPORT_MAX_PHOTOS", 2000)
+# How many PV exports may run AT THE SAME TIME across ALL customers. Each export
+# is memory-heavy (downloads many photos + builds a PDF in RAM), so keeping this
+# low protects a small server from running out of memory and locking up.
+PV_EXPORT_MAX_CONCURRENT = _int("PV_EXPORT_MAX_CONCURRENT", 1)
 
 # ---- Pause between joining each personal group from a link list ----
 GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
@@ -294,7 +299,7 @@ def validate_customer() -> list:
     if not WALLET_ADDRESS:
         problems.append("WALLET_ADDRESS")
     if not TRON_API_KEY:
-        problems.append("TRON_API_KEY")
+        problems.append("TRON_API_KEY (warning: TronGrid rate-limits without key)")
     return problems
 
 

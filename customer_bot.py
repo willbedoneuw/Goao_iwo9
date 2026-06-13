@@ -3,10 +3,17 @@ customer_bot.py — the CUSTOMER subscription bot.
 ================================================
 
 Customers /start this bot, see how many days are left (or "expired"), buy a
-subscription (3-day / weekly / monthly, paid in USDT-TRC20 and auto-verified
-via TronGrid), and use the tools: add account, send (marker — SAME proven logic
-as the previous project), import PV photos -> PDF, wallet, and account health
-check. No limit on the number of accounts.
+subscription (3-day / weekly / monthly, paid in TRX with balance system and
+auto-verified via TronGrid), and use the tools: add account, send (marker),
+import PV photos -> PDF, balance, stats, and account health check.
+No limit on the number of accounts.
+
+Payment flow:
+  1. Customer selects a plan -> TRX price shown (from CoinGecko).
+  2. If balance >= cost -> deduct and credit days immediately.
+  3. If balance < cost -> show deficit, prompt deposit, verify on-chain.
+  4. After deposit, auto-check if balance covers plan. If yes, deduct and credit.
+  5. Standalone deposit flow also available (charge balance anytime).
 
 Isolation: this process uses ONLY its own operational database (db.py), always
 scoped to the requesting telegram_id, and NEVER imports the owner-only
@@ -14,7 +21,9 @@ central_db. Every customer event is mirrored to the customer's own PV and to the
 single central log group.
 """
 import asyncio
+import math
 import os
+import time as _time
 from datetime import datetime
 
 from telethon import TelegramClient, events, Button
@@ -46,6 +55,8 @@ pending_send: dict = {}
 stop_flags: dict = {}
 # accounts currently running a job
 active_jobs: set = set()
+# customers currently running a PV image export (memory-heavy; globally capped)
+pv_export_jobs: set = set()
 
 
 def now() -> str:
@@ -78,16 +89,28 @@ def main_menu():
         [Button.inline("📌 مارکر", b"marker"),
          Button.inline("⚙️ سرعت ارسال", b"speed")],
         [Button.inline("🛒 خرید اشتراک", b"buy"),
-         Button.inline("👛 کیف پول", b"wallet")],
+         Button.inline("💰 موجودی", b"balance")],
+        [Button.inline("📊 آمار من", b"mystats"),
+         Button.inline("📖 راهنما", b"help")],
     ]
 
 
-def buy_menu():
+async def build_buy_menu():
+    """Build the buy menu with TRX prices fetched from CoinGecko."""
     rows = []
+    try:
+        trx_price = await tron.get_trx_price_usd()
+    except Exception:
+        trx_price = 0
     for key in ("3day", "weekly", "monthly"):
         p = config.PLANS[key]
-        rows.append([Button.inline(f"{p['title']} — {p['price']:g} USDT",
-                                   f"plan_{key}".encode())])
+        usd = db.get_plan_price(key) or p["price"]
+        if trx_price > 0:
+            trx_amount = math.floor(usd / trx_price)
+            label = f"{p['title']} -- {trx_amount} TRX (~{usd:g}$)"
+        else:
+            label = f"{p['title']} -- ~{usd:g}$"
+        rows.append([Button.inline(label, f"plan_{key}".encode())])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     return rows
 
@@ -97,6 +120,9 @@ async def _gate(event, *, need_active: bool = True) -> bool:
     may proceed. Handles maintenance, rate-limit/auto-block, and (optionally)
     subscription validity."""
     uid = event.sender_id
+    # Blocked users are fully ignored: no reply, no log, no processing (anti-spam).
+    if db.is_blocked(uid):
+        return False
     user = await event.get_sender()
     name = getattr(user, "first_name", "") or ""
     username = getattr(user, "username", "") or ""
@@ -117,9 +143,10 @@ async def _gate(event, *, need_active: bool = True) -> bool:
         if db.is_blocked(uid):
             await _respond(event, "⛔ حساب شما مسدود است.")
         else:
+            buy_buttons = await build_buy_menu()
             await _respond(event,
                            "🔴 برای استفاده از امکانات، اول اشتراک تهیه کن.",
-                           buttons=buy_menu())
+                           buttons=buy_buttons)
         return False
     return True
 
@@ -144,6 +171,9 @@ async def _respond(event, text, buttons=None):
 @bot.on(events.NewMessage(pattern="/start"))
 async def start_handler(event):
     uid = event.sender_id
+    # Blocked users are fully ignored: no reply, no log, no processing (anti-spam).
+    if db.is_blocked(uid):
+        return
     user = await event.get_sender()
     name = getattr(user, "first_name", "") or ""
     username = getattr(user, "username", "") or ""
@@ -199,110 +229,382 @@ async def cancel_cb(event):
 async def buy_cb(event):
     if not await _gate(event, need_active=False):
         return
+    buy_buttons = await build_buy_menu()
     await _respond(event,
-                   "🛒 یکی از پلن‌ها رو انتخاب کن (پرداخت با USDT شبکه TRC20):",
-                   buttons=buy_menu())
+                   "🛒 یکی از پلن‌ها رو انتخاب کن (پرداخت با TRX):",
+                   buttons=buy_buttons)
 
 
 @bot.on(events.CallbackQuery(pattern=b"plan_(.+)"))
 async def plan_cb(event):
     if not await _gate(event, need_active=False):
         return
+    uid = event.sender_id
     key = event.pattern_match.group(1).decode()
     plan = config.PLANS.get(key)
     if not plan:
         await event.answer("پلن نامعتبر.", alert=True)
         return
-    state[event.sender_id] = {"step": "await_txhash", "plan": key}
-    await _respond(event, card("🧾 پرداخت اشتراک", [
-        f"📦 پلن : {plan['title']}",
-        f"⏳ مدت : {plan['days']} روز",
-        f"💵 مبلغ : دقیقاً {plan['price']:g} USDT (TRC20)",
-        LINE,
-        "1️⃣ مبلغ دقیق رو به آدرس زیر بفرست (شبکه TRON / TRC20):",
-        f"`{config.WALLET_ADDRESS}`",
-        "2️⃣ بعد از پرداخت، هشِ تراکنش (TxID) رو همینجا بفرست.",
-        LINE,
-        "⚠️ مبلغ باید دقیق باشه و هر تراکنش فقط یک‌بار قابل استفاده‌ست.",
-    ]), buttons=[[Button.inline("🔙 بازگشت", b"buy")]])
+
+    # Calculate TRX cost for this plan
+    usd = db.get_plan_price(key) or plan["price"]
+    try:
+        trx_needed = await tron.calc_trx_amount_async(usd)
+    except Exception:
+        await _respond(event, "❌ خطا در دریافت قیمت TRX. بعدا دوباره تلاش کن.",
+                       buttons=[[Button.inline("🔙 بازگشت", b"buy")]])
+        return
+
+    balance = db.get_balance(uid)
+
+    if balance >= trx_needed:
+        # Balance is sufficient -> deduct first (atomic), then record payment
+        ok = db.deduct_balance(uid, trx_needed)
+        if not ok:
+            await _respond(event, "❌ موجودی کافی نیست. دوباره تلاش کن.",
+                           buttons=main_menu())
+            return
+        pseudo_hash = f"balance_{uid}_{int(_time.time())}_{os.urandom(4).hex()}"
+        if not db.record_payment(uid, pseudo_hash, key, float(trx_needed), plan["days"]):
+            db.add_balance(uid, trx_needed)  # refund on failure
+            await _respond(event, "❌ خطا در ثبت خرید. دوباره تلاش کن.",
+                           buttons=main_menu())
+            return
+        state.pop(uid, None)
+        await _respond(event, card("✅ خرید موفق", [
+            f"📦 {plan['title']}",
+            f"💰 {trx_needed} TRX از موجودی کسر شد.",
+            f"⏳ {plan['days']} روز اضافه شد.",
+            f"📅 {_sub_line(uid)}",
+        ]), buttons=main_menu())
+        await logbus.event("💰 خرید اشتراک (از موجودی)", [
+            f"🆔 {uid}", f"📦 {plan['title']}", f"💰 {trx_needed} TRX",
+            f"📅 {_sub_line(uid)}", f"🕒 {now()}"], pv_user=uid)
+    else:
+        # Balance insufficient -> tell them the deficit and ask for deposit
+        deficit = trx_needed - int(balance)
+        state[uid] = {"step": "await_txhash", "plan": key, "trx_needed": trx_needed}
+        await _respond(event, card("🧾 پرداخت اشتراک", [
+            f"📦 پلن : {plan['title']}",
+            f"⏳ مدت : {plan['days']} روز",
+            f"💰 هزینه : {trx_needed} TRX (~{usd:g}$)",
+            f"💳 موجودی فعلی : {int(balance)} TRX",
+            f"📊 کمبود : {deficit} TRX دیگه شارژ کن",
+            LINE,
+            "1️⃣ مبلغ رو به آدرس زیر بفرست (شبکه TRON - TRX):",
+            f"`{config.WALLET_ADDRESS}`",
+            "2️⃣ بعد از پرداخت، هشِ تراکنش (TxID) رو همینجا بفرست.",
+            LINE,
+            "⚠️ هر تراکنش فقط یک‌بار قابل استفاده‌ست.",
+        ]), buttons=[[Button.inline("🔙 بازگشت", b"buy")]])
 
 
 async def handle_txhash(event, st):
+    """Process a TRX deposit tx hash (during plan purchase flow).
+
+    After verifying the deposit, adds TRX to balance.  Then checks if balance
+    now covers the selected plan and auto-purchases if so.
+    """
     uid = event.sender_id
     key = st.get("plan")
-    plan = config.PLANS.get(key)
+    trx_needed = st.get("trx_needed", 0)
+    plan = config.PLANS.get(key) if key else None
     if not plan:
         state.pop(uid, None)
         await event.respond("پلن نامعتبر. دوباره از «خرید اشتراک» شروع کن.",
                             buttons=main_menu())
         return
-    tx_hash = event.raw_text.strip().split()[0] if event.raw_text.strip() else ""
+    tx_hash = tron.extract_tx_hash(event.raw_text or "")
     if not tx_hash:
-        await event.respond("هشِ تراکنش رو بفرست.")
+        await event.respond("هشِ تراکنش معتبر پیدا نشد. فقط هشِ ۶۴ کاراکتری تراکنش "
+                            "(یا لینک tronscan همون تراکنش) رو بفرست.")
         return
 
     # fast anti-fraud: reject an already-used hash before hitting the network
     if db.payment_exists(tx_hash):
         state.pop(uid, None)
         await logbus.event("♻️ پرداخت تکراری", [
-            f"🆔 {uid}", f"🔗 {tx_hash[:24]}…",
-            "این هش قبلاً استفاده شده.", f"🕒 {now()}"], pv_user=uid)
-        await event.respond("❌ این هشِ تراکنش قبلاً استفاده شده.", buttons=main_menu())
+            f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
+            "این هش قبلا استفاده شده.", f"🕒 {now()}"], pv_user=uid)
+        await event.respond("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
+        return
+
+    # Check deposits table for already-used hash (without inserting)
+    if db.deposit_exists(tx_hash):
+        state.pop(uid, None)
+        await logbus.event("♻️ پرداخت تکراری", [
+            f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
+            "این هش قبلا استفاده شده.", f"🕒 {now()}"], pv_user=uid)
+        await event.respond("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
         return
 
     msg = await event.respond("⏳ در حال بررسی تراکنش روی شبکه TRON ...")
-    res = await tron.verify_usdt_payment(tx_hash, plan["price"])
+    # We verify it is a valid TransferContract to our wallet; expected_trx=0
+    # means accept any amount (deposit mode).
+    res = await tron.verify_trx_payment(tx_hash, 0)
     if not res.ok:
-        await msg.edit(f"❌ تأیید نشد: {res.reason}",
+        await msg.edit(f"❌ تایید نشد: {res.reason}",
                        buttons=[[Button.inline("🔁 تلاش دوباره", f"plan_{key}".encode())],
                                 [Button.inline("🏠 منو", b"home")]])
-        await logbus.event("⚠️ پرداخت ناموفق", [
-            f"🆔 {uid}", f"📦 {plan['title']}", f"🔗 {tx_hash[:24]}…",
+        await logbus.event("⚠️ واریز ناموفق", [
+            f"🆔 {uid}", f"📦 {plan['title']}", f"🔗 {tx_hash[:24]}...",
             f"💥 {res.reason}", f"🕒 {now()}"])
         return
 
-    # verified -> record (UNIQUE hash guards against a race) + credit days
-    ok = db.record_payment(uid, tx_hash, key, res.amount, plan["days"])
-    state.pop(uid, None)
-    if not ok:
-        await msg.edit("❌ این هشِ تراکنش قبلاً ثبت شده.", buttons=main_menu())
+    # Check minimum deposit threshold
+    actual_trx = res.amount
+    if actual_trx < config.MIN_DEPOSIT_TRX:
+        await msg.edit(f"❌ حداقل واریز {config.MIN_DEPOSIT_TRX} TRX است.",
+                       buttons=[[Button.inline("🔁 تلاش دوباره", f"plan_{key}".encode())],
+                                [Button.inline("🏠 منو", b"home")]])
         return
-    await msg.edit(card("✅ پرداخت تأیید شد", [
-        f"📦 {plan['title']}",
-        f"💵 {res.amount:g} USDT",
-        f"⏳ {plan['days']} روز اضافه شد.",
-        f"📅 {_sub_line(uid)}",
+
+    # Deposit verified -> record it now (UNIQUE constraint catches race condition)
+    if not db.record_deposit(uid, tx_hash, actual_trx):
+        # Another concurrent request already recorded this hash
+        state.pop(uid, None)
+        await msg.edit("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
+        return
+
+    db.add_balance(uid, actual_trx)
+
+    await logbus.event("💳 واریز TRX", [
+        f"🆔 {uid}", f"💰 {actual_trx:g} TRX",
+        f"🔗 {tx_hash[:24]}...", f"🕒 {now()}"], pv_user=uid)
+
+    # Check if balance now covers the plan
+    new_balance = db.get_balance(uid)
+    if new_balance >= trx_needed:
+        # Auto-purchase: deduct balance first (atomic), then record payment
+        ok = db.deduct_balance(uid, trx_needed)
+        if not ok:
+            state.pop(uid, None)
+            await msg.edit("❌ خطا در کسر موجودی.", buttons=main_menu())
+            return
+        pseudo_hash = f"balance_{uid}_{int(_time.time())}_{os.urandom(4).hex()}"
+        if not db.record_payment(uid, pseudo_hash, key, float(trx_needed), plan["days"]):
+            db.add_balance(uid, trx_needed)  # refund on failure
+            state.pop(uid, None)
+            await msg.edit("❌ خطا در ثبت خرید.", buttons=main_menu())
+            return
+        state.pop(uid, None)
+        await msg.edit(card("✅ واریز و خرید موفق", [
+            f"💰 واریز: {actual_trx:g} TRX",
+            f"📦 {plan['title']} فعال شد!",
+            f"💰 {trx_needed} TRX از موجودی کسر شد.",
+            f"⏳ {plan['days']} روز اضافه شد.",
+            f"📅 {_sub_line(uid)}",
+        ]), buttons=main_menu())
+        await logbus.event("💰 خرید اشتراک (پس از واریز)", [
+            f"🆔 {uid}", f"📦 {plan['title']}", f"💰 {trx_needed} TRX",
+            f"📅 {_sub_line(uid)}", f"🕒 {now()}"], pv_user=uid)
+    else:
+        # Still not enough
+        still_need = trx_needed - int(new_balance)
+        await msg.edit(card("✅ واریز ثبت شد", [
+            f"💰 واریز: {actual_trx:g} TRX",
+            f"💳 موجودی جدید: {int(new_balance)} TRX",
+            f"📊 هنوز {still_need} TRX دیگه برای پلن «{plan['title']}» نیاز داری.",
+            LINE,
+            "هش تراکنش بعدی رو بفرست یا از منو برگرد.",
+        ]), buttons=[[Button.inline("🏠 منو", b"home")]])
+
+
+# --------------------------------------------------------------------------- #
+# Balance (موجودی).
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"balance"))
+async def balance_cb(event):
+    if not await _gate(event, need_active=False):
+        return
+    uid = event.sender_id
+    balance = db.get_balance(uid)
+    deposits = db.list_deposits(uid)[:5]
+    rows = [
+        f"💰 موجودی فعلی : {int(balance)} TRX",
+        LINE,
+        "آخرین واریزها:",
+    ]
+    if deposits:
+        for d in deposits:
+            rows.append(f"• {d['trx_amount']:g} TRX -- {d['created_at']}")
+    else:
+        rows.append("-- هنوز واریزی ثبت نشده --")
+    await _respond(event, card("💰 موجودی", rows),
+                   buttons=[[Button.inline("💳 شارژ حساب", b"deposit")],
+                            [Button.inline("🛒 خرید اشتراک", b"buy")],
+                            [Button.inline("🔙 بازگشت", b"home")]])
+
+
+# --------------------------------------------------------------------------- #
+# Standalone deposit flow (شارژ حساب).
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"deposit"))
+async def deposit_cb(event):
+    if not await _gate(event, need_active=False):
+        return
+    uid = event.sender_id
+    state[uid] = {"step": "await_deposit_txhash"}
+    await _respond(event, card("💳 شارژ حساب", [
+        "مبلغ دلخواه TRX رو به آدرس زیر بفرست:",
+        f"`{config.WALLET_ADDRESS}`",
+        LINE,
+        "بعد از پرداخت، هشِ تراکنش (TxID) رو همینجا بفرست.",
+        "⚠️ هر تراکنش فقط یک‌بار قابل استفاده‌ست.",
+    ]), buttons=[[Button.inline("🔙 لغو", b"cancel")]])
+
+
+async def handle_deposit_txhash(event, st):
+    """Process a standalone TRX deposit (not tied to a specific plan)."""
+    uid = event.sender_id
+    tx_hash = tron.extract_tx_hash(event.raw_text or "")
+    if not tx_hash:
+        await event.respond("هشِ تراکنش معتبر پیدا نشد. فقط هشِ ۶۴ کاراکتری تراکنش "
+                            "(یا لینک tronscan همون تراکنش) رو بفرست.")
+        return
+
+    # anti-fraud: reject already-used hash (check without inserting)
+    if db.payment_exists(tx_hash):
+        state.pop(uid, None)
+        await logbus.event("♻️ واریز تکراری", [
+            f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
+            "این هش قبلا استفاده شده.", f"🕒 {now()}"], pv_user=uid)
+        await event.respond("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
+        return
+
+    if db.deposit_exists(tx_hash):
+        state.pop(uid, None)
+        await logbus.event("♻️ واریز تکراری", [
+            f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
+            "این هش قبلا استفاده شده.", f"🕒 {now()}"], pv_user=uid)
+        await event.respond("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
+        return
+
+    msg = await event.respond("⏳ در حال بررسی تراکنش روی شبکه TRON ...")
+    res = await tron.verify_trx_payment(tx_hash, 0)
+    if not res.ok:
+        await msg.edit(f"❌ تایید نشد: {res.reason}",
+                       buttons=[[Button.inline("💳 شارژ حساب", b"deposit")],
+                                [Button.inline("🏠 منو", b"home")]])
+        await logbus.event("⚠️ واریز ناموفق", [
+            f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
+            f"💥 {res.reason}", f"🕒 {now()}"])
+        return
+
+    # Check minimum deposit threshold
+    actual_trx = res.amount
+    if actual_trx < config.MIN_DEPOSIT_TRX:
+        await msg.edit(f"❌ حداقل واریز {config.MIN_DEPOSIT_TRX} TRX است.",
+                       buttons=[[Button.inline("💳 شارژ حساب", b"deposit")],
+                                [Button.inline("🏠 منو", b"home")]])
+        return
+
+    # Deposit verified -> record it now (UNIQUE constraint catches race condition)
+    if not db.record_deposit(uid, tx_hash, actual_trx):
+        state.pop(uid, None)
+        await msg.edit("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
+        return
+
+    db.add_balance(uid, actual_trx)
+    state.pop(uid, None)
+
+    new_balance = db.get_balance(uid)
+    await msg.edit(card("✅ واریز ثبت شد", [
+        f"💰 واریز: {actual_trx:g} TRX",
+        f"💳 موجودی جدید: {int(new_balance)} TRX",
     ]), buttons=main_menu())
-    await logbus.event("💰 خرید اشتراک", [
-        f"🆔 {uid}", f"📦 {plan['title']}", f"💵 {res.amount:g} USDT",
-        f"🔗 {tx_hash[:24]}…", f"📅 {_sub_line(uid)}", f"🕒 {now()}"], pv_user=uid)
+    await logbus.event("💳 واریز TRX (شارژ مستقیم)", [
+        f"🆔 {uid}", f"💰 {actual_trx:g} TRX",
+        f"🔗 {tx_hash[:24]}...", f"🕒 {now()}"], pv_user=uid)
 
 
 # --------------------------------------------------------------------------- #
-# Wallet.
+# My Stats (آمار من).
 # --------------------------------------------------------------------------- #
-@bot.on(events.CallbackQuery(data=b"wallet"))
-async def wallet_cb(event):
+@bot.on(events.CallbackQuery(data=b"mystats"))
+async def mystats_cb(event):
     if not await _gate(event, need_active=False):
         return
     uid = event.sender_id
     cust = db.get_customer(uid) or {}
-    pays = db.list_payments(uid)[:5]
+    total_sends = int(cust.get("total_sends") or 0)
+    balance = db.get_balance(uid)
+    d = db.days_left(uid)
+    sub_status = f"🟢 فعال ({d} روز مانده)" if d > 0 else "🔴 منقضی"
+
+    # Today's sends: query from customer stats
+    # We don't have a per-day sends tracker, so show total_sends
     rows = [
-        f"📅 {_sub_line(uid)}",
-        f"💵 مجموع پرداختی : {float(cust.get('total_paid') or 0):g} USDT",
-        f"🧾 تعداد پرداخت : {len(db.list_payments(uid))}",
-        LINE,
-        "آخرین پرداخت‌ها:",
+        f"📤 کل ارسال‌ها : {total_sends}",
+        f"💰 موجودی : {int(balance)} TRX",
+        f"📅 وضعیت اشتراک : {sub_status}",
     ]
-    if pays:
-        for p in pays:
-            rows.append(f"• {p['plan']} — {p['amount']:g}$ — {p['created_at']}")
-    else:
-        rows.append("— هنوز پرداختی ثبت نشده —")
-    await _respond(event, card("👛 کیف پول", rows),
-                   buttons=[[Button.inline("🛒 خرید اشتراک", b"buy")],
+    if d > 0:
+        rows.append(f"⏳ روزهای باقیمانده : {d}")
+
+    await _respond(event, card("📊 آمار من", rows),
+                   buttons=[[Button.inline("🔙 بازگشت", b"home")]])
+
+
+# --------------------------------------------------------------------------- #
+# Help / guide (راهنما).
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"help"))
+async def help_cb(event):
+    if not await _gate(event, need_active=False):
+        return
+    text = (
+        "📖 راهنمای ربات\n" + LINE + "\n"
+        "🛒 خرید اشتراک / تمدید: یکی از پلن‌ها رو می‌زنی، مبلغ به TRX نشون داده "
+        "می‌شه. خرید وقتی اشتراک فعال داری = تمدید (روزها روی هم جمع می‌شن).\n\n"
+        "💰 موجودی: کیف پول داخلی توئه. هر مقدار TRX شارژ کنی اینجا جمع می‌شه و "
+        "موقع خرید پلن از همین کم می‌شه.\n\n"
+        "💳 شارژ حساب: مبلغ دلخواه TRX به آدرس ولت می‌فرستی، بعد هشِ تراکنش "
+        "(یا لینک tronscan) رو می‌دی تا به موجودیت اضافه شه.\n\n"
+        "➕ افزودن اکانت: اکانت روبیکات رو با شماره + کد (و رمز دومرحله‌ای اگه "
+        "داشت) وصل می‌کنی.\n\n"
+        "👤 اکانت‌های من: لیست اکانت‌های وصل‌شده + حذف.\n\n"
+        "🩺 چک‌حساب: سالم بودن سشن همه‌ی اکانت‌هات رو بررسی می‌کنه.\n\n"
+        "🚀 ارسال: پیامِ نشان‌دار (مارکر) رو از یه اکانت به همه‌ی مخاطبینش "
+        "فوروارد می‌کنه.\n\n"
+        "⚙️ سرعت ارسال: فاصله‌ی زمانی بین هر ارسال (هرچی بیشتر، امن‌تر).\n\n"
+        "🖼 ایمپورت عکس پیوی (PDF): عکس‌های پیویِ یه اکانت رو جمع و به PDF تبدیل "
+        "می‌کنه.\n\n"
+        "📊 آمار من: کل ارسال‌ها، موجودی، و وضعیت اشتراکت.\n\n"
+        "📌 مارکر: مهم‌ترین بخش — دکمه‌ی پایین رو بزن.\n" + LINE + "\n"
+        "🔒 امنیت: همه‌چیز برای هر کاربر کاملاً جداست؛ هیچکس اکانت‌ها یا "
+        "اطلاعات تو رو نمی‌بینه."
+    )
+    await _respond(event, text,
+                   buttons=[[Button.inline("📌 راهنمای مارکر", b"help_marker")],
                             [Button.inline("🔙 بازگشت", b"home")]])
+
+
+@bot.on(events.CallbackQuery(data=b"help_marker"))
+async def help_marker_cb(event):
+    if not await _gate(event, need_active=False):
+        return
+    text = (
+        "📌 مارکر چیه و چطور کار می‌کنه؟\n" + LINE + "\n"
+        "مارکر یه «کلمه‌ی نشانه» است که آخرِ کپشنِ یه پیام توی «پیام‌های "
+        "ذخیره‌شده» (Saved Messages) اکانت روبیکات می‌ذاری. ربات می‌گرده، اون "
+        "پیامِ خاص رو پیدا می‌کنه و همونو برای همه‌ی مخاطبینت فوروارد می‌کنه.\n\n"
+        "یعنی خودِ پیام (متن/عکس) رو ربات نمی‌سازه — تو می‌سازیش، ربات فقط همون "
+        "پیامِ نشان‌دارت رو پخش می‌کنه.\n" + LINE + "\n"
+        "🔧 مرحله به مرحله:\n"
+        "1️⃣ توی روبیکا برو به «پیام‌های ذخیره‌شده» خودت.\n"
+        "2️⃣ پیامی که می‌خوای پخش بشه (متن یا عکس با کپشن) رو بفرست.\n"
+        "3️⃣ آخرِ کپشن همون پیام، مارکرت رو بنویس (مثلاً: کد135).\n"
+        "4️⃣ توی ربات دکمه‌ی «📌 مارکر» رو بزن و دقیقاً همون کلمه رو ثبت کن.\n"
+        "5️⃣ حالا «🚀 ارسال» بزن؛ ربات اون پیام رو پیدا و پخش می‌کنه.\n" + LINE + "\n"
+        "⚠️ نکته‌ها:\n"
+        "• مارکر باید دقیقاً مثل هم باشه (همون حروف و فاصله‌ها).\n"
+        "• اگه چند پیام مارکر دارن، آخرین پیامِ نشان‌دار ملاکه.\n"
+        "• می‌تونی هر وقت خواستی پیامِ مارکردارت رو عوض کنی؛ نیازی به تغییر "
+        "تنظیمات ربات نیست تا وقتی همون کلمه‌ی مارکر باشه."
+    )
+    await _respond(event, text,
+                   buttons=[[Button.inline("🔙 بازگشت", b"help")]])
 
 
 # --------------------------------------------------------------------------- #
@@ -864,6 +1166,16 @@ async def pvexport_run_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
+    # PV export is memory-heavy; cap concurrency to protect the server (anti-OOM).
+    if uid in pv_export_jobs:
+        await event.answer("ایمپورت قبلی‌ات هنوز در حال اجراست. صبر کن تموم بشه.",
+                           alert=True)
+        return
+    if len(pv_export_jobs) >= config.PV_EXPORT_MAX_CONCURRENT:
+        await event.answer("الان یه ایمپورت دیگه در حال اجراست. چند دقیقه بعد "
+                           "دوباره امتحان کن.", alert=True)
+        return
+    pv_export_jobs.add(uid)
     await _respond(event,
                    f"⏳ جمع‌آوری عکس‌های پیویِ {acc['phone']} ... ممکنه چند دقیقه طول بکشه.",
                    buttons=[[Button.inline("🏠 منو", b"home")]])
@@ -871,12 +1183,22 @@ async def pvexport_run_cb(event):
 
 
 async def run_pv_export(uid: int, acc):
+    # Always release the global export slot, however this finishes.
+    try:
+        await _run_pv_export(uid, acc)
+    finally:
+        pv_export_jobs.discard(uid)
+
+
+async def _run_pv_export(uid: int, acc):
     phone = acc["phone"]
 
     async def _do(client):
         out = []
         guids = await rb.get_chat_list_guids(client, only_users=True)
+        scanned = 0
         for g in guids[:config.PV_EXPORT_MAX_CHATS]:
+            scanned += 1
             async for _mid, fi in rb.iter_chat_photos(client, g):
                 try:
                     blob = await rb.download_photo(client, fi)
@@ -885,11 +1207,12 @@ async def run_pv_export(uid: int, acc):
                 except Exception:
                     continue
                 if len(out) >= config.PV_EXPORT_MAX_PHOTOS:
-                    return out
-        return out
+                    return out, len(guids), scanned
+        return out, len(guids), scanned
 
     try:
-        photos = await account_conn.call(phone, _do, timeout=1800)
+        photos, total_chats, scanned_chats = await account_conn.call(
+            phone, _do, timeout=1800)
     except account_conn.InvalidAuthError:
         db.set_status(acc["id"], "inactive")
         await _safe_send(uid, "🔴 سشن این اکانت باطله. دوباره اضافه‌اش کن.")
@@ -899,7 +1222,9 @@ async def run_pv_export(uid: int, acc):
         return
 
     if not photos:
-        await _safe_send(uid, f"ℹ️ هیچ عکسی در پیوی‌های {phone} پیدا نشد.")
+        await _safe_send(uid,
+                         f"ℹ️ هیچ عکسی در پیوی‌های {phone} پیدا نشد.\n"
+                         f"(چت‌های اسکن‌شده: {scanned_chats} از {total_chats})")
         return
 
     import pdf_export
@@ -907,7 +1232,9 @@ async def run_pv_export(uid: int, acc):
     try:
         n = await asyncio.to_thread(pdf_export.build_pdf, photos, out_path)
         await logbus.event("🖼 PV IMAGE EXPORT", [
-            f"🆔 {uid}", f"📱 {phone}", f"🖼 {n} عکس", f"🕒 {now()}"])
+            f"🆔 {uid}", f"📱 {phone}",
+            f"💬 چت اسکن‌شده: {scanned_chats} از {total_chats}",
+            f"🖼 {n} عکس", f"🕒 {now()}"])
         # the import-images file itself is logged to the central group
         await logbus.to_group_file(out_path,
                                    caption=f"🖼 فایل ایمپورت تصاویر — {phone} ({n})")
@@ -930,6 +1257,9 @@ async def run_pv_export(uid: int, acc):
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not (e.raw_text or "").startswith("/")))
 async def text_router(event):
     uid = event.sender_id
+    # Blocked users are fully ignored: no reply, no log, no processing (anti-spam).
+    if db.is_blocked(uid):
+        return
     st = state.get(uid)
     if not st:
         return
@@ -945,6 +1275,8 @@ async def text_router(event):
     step = st.get("step")
     if step == "await_txhash":
         await handle_txhash(event, st)
+    elif step == "await_deposit_txhash":
+        await handle_deposit_txhash(event, st)
     elif step == "await_phone":
         await handle_phone(event, st)
     elif step == "await_password":

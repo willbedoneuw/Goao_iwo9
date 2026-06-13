@@ -9,6 +9,8 @@ Only the configured OWNER may use it. It manages the whole service:
   * add a customer manually + add/subtract subscription time + instant block /
     unblock
   * broadcast a message to every customer
+  * plan price management + TRX price settings
+  * transaction list
   * worker management + worker logs (reused worker subsystem)
   * maintenance mode toggle + on-demand system backup
 
@@ -31,6 +33,7 @@ import config
 import crypto_util
 import db
 import logbus
+import tron
 import worker
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -73,6 +76,8 @@ def main_menu():
          Button.inline("🏆 رتبه‌بندی", b"ranking")],
         [Button.inline("➕ افزودن مشتری", b"addcust"),
          Button.inline("📣 پیام همگانی", b"broadcast")],
+        [Button.inline("💲 تنظیمات قیمت", b"prices"),
+         Button.inline("📋 تراکنش‌ها", b"txlist")],
         [Button.inline("🛠 ورکرها", b"workers"),
          Button.inline("🧰 تعمیر/بکاپ", b"sys")],
     ]
@@ -117,11 +122,25 @@ async def dash_cb(event):
     workers = db.list_workers()
     healthy = sum(1 for w in workers if w.get("status") == "ok")
     health_pct = (s["active_accounts"] / s["accounts"] * 100) if s["accounts"] else 0
+
+    # Financial stats (TRX)
+    today_trx = db.today_revenue_trx()
+    week_trx = db.week_revenue_trx()
+    month_trx = db.month_revenue_trx()
+
+    # TRX price
+    try:
+        trx_price = await tron.get_trx_price_usd()
+    except Exception:
+        trx_price = 0.0
+
     await safe_edit(event, card("📊 داشبورد", [
         f"👥 مشتری‌ها : {s['customers']}  (فعال: {s['active_subs']} | مسدود: {s['blocked']})",
         f"📱 اکانت‌ها : {s['accounts']}  (فعال: {s['active_accounts']})",
         f"🚀 کل ارسال : {s['sends']}",
-        f"💰 درآمد : {s['revenue']:g} USDT",
+        f"💰 درآمد کل : {s['revenue']:g} TRX",
+        f"📈 امروز : {today_trx:g} TRX | هفته : {week_trx:g} TRX | ماه : {month_trx:g} TRX",
+        f"💲 قیمت TRX : {trx_price:g} USD" if trx_price > 0 else "💲 قیمت TRX : نامشخص",
         f"🩺 سلامت کلی اکانت‌ها : {health_pct:.0f}%",
         f"🛠 ورکرها : {len(workers)} (سالم: {healthy})",
         f"🕒 {now()}",
@@ -169,7 +188,7 @@ def _profile_text(c) -> str:
         f"📅 انقضا : {c.get('expires_at') or '-'}",
         f"📱 اکانت‌ها : {db.count_customer_accounts(uid)}",
         f"🚀 کل ارسال : {c.get('total_sends') or 0}",
-        f"💵 مجموع پرداخت : {float(c.get('total_paid') or 0):g} USDT",
+        f"💵 مجموع پرداخت : {float(c.get('total_paid') or 0):g} TRX",
         f"📝 یادداشت : {c.get('note') or '-'}",
     ])
 
@@ -339,6 +358,28 @@ async def broadcast_cb(event):
                     buttons=[[Button.inline("🔙 لغو", b"home")]])
 
 
+@bot.on(events.CallbackQuery(data=b"broadcast_confirm"))
+async def broadcast_confirm_cb(event):
+    if not is_owner(event):
+        return
+    st = state.get(event.sender_id)
+    if not st or st.get("step") != "await_broadcast_confirm":
+        await safe_edit(event, "خطا: متنی ذخیره نشده.", buttons=main_menu())
+        return
+    text = st.get("broadcast_text", "")
+    state.pop(event.sender_id, None)
+    await safe_edit(event, "📣 در حال ارسال ...")
+    await do_broadcast(event, text)
+
+
+@bot.on(events.CallbackQuery(data=b"broadcast_cancel"))
+async def broadcast_cancel_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, "لغو شد.", buttons=main_menu())
+
+
 async def do_broadcast(event, text):
     customers = db.list_customers()
     ok = 0
@@ -355,6 +396,149 @@ async def do_broadcast(event, text):
     await logbus.to_group(card("📣 BROADCAST", [
         f"✅ {ok}   ❌ {fail}   👥 {len(customers)}", f"🕒 {now()}"]))
     await event.respond(f"📣 ارسال شد. ✅ {ok} / ❌ {fail}", buttons=main_menu())
+
+
+# --------------------------------------------------------------------------- #
+# Price Management.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"prices"))
+async def price_settings_cb(event):
+    if not is_owner(event):
+        return
+    rows = []
+    for key, plan in config.PLANS.items():
+        override = db.get_plan_price(key)
+        current = override if override is not None else plan["price"]
+        label = f"{plan['title']} : {current:g} USD"
+        if override is not None:
+            label += " (تغییر داده‌شده)"
+        rows.append(label)
+
+    btns = []
+    for key, plan in config.PLANS.items():
+        btns.append([Button.inline(f"✏️ تغییر {plan['title']}", f"setprice_{key}".encode())])
+    btns.append([Button.inline("⚙️ تنظیمات TRX", b"trx_settings")])
+    btns.append([Button.inline("🔙 بازگشت", b"home")])
+
+    await safe_edit(event, card("💲 تنظیمات قیمت", rows), buttons=btns)
+
+
+@bot.on(events.CallbackQuery(pattern=b"setprice_(.+)"))
+async def setprice_cb(event):
+    if not is_owner(event):
+        return
+    plan_key = event.pattern_match.group(1).decode()
+    if plan_key not in config.PLANS:
+        await event.answer("پلن نامعتبر.", alert=True)
+        return
+    plan = config.PLANS[plan_key]
+    state[event.sender_id] = {"step": "await_price_input", "plan_key": plan_key}
+    override = db.get_plan_price(plan_key)
+    current = override if override is not None else plan["price"]
+    await safe_edit(event,
+                    f"✏️ قیمت فعلی {plan['title']}: {current:g} USD\n"
+                    f"قیمت جدید رو بفرست (عدد به دلار):",
+                    buttons=[[Button.inline("🔙 لغو", b"prices")]])
+
+
+@bot.on(events.CallbackQuery(data=b"trx_settings"))
+async def trx_settings_cb(event):
+    if not is_owner(event):
+        return
+    try:
+        trx_price = await tron.get_trx_price_usd()
+    except Exception:
+        trx_price = 0.0
+
+    override_val = db.get_setting("trx_price_override", "0")
+    tolerance_val = db.get_setting("payment_tolerance_percent",
+                                   str(config.PAYMENT_TOLERANCE_PERCENT))
+
+    rows = [
+        f"💲 قیمت لحظه‌ای TRX : {trx_price:g} USD" if trx_price > 0 else "💲 قیمت TRX : نامشخص",
+        f"🔧 اورراید قیمت : {override_val} USD" + (" (غیرفعال)" if float(override_val or 0) <= 0 else " (فعال)"),
+        f"📏 تلرانس پرداخت : {tolerance_val}%",
+    ]
+    btns = [
+        [Button.inline("✏️ تنظیم اورراید قیمت", b"set_trx_override")],
+        [Button.inline("✏️ تنظیم تلرانس", b"set_tolerance")],
+        [Button.inline("🔙 بازگشت", b"prices")],
+    ]
+    await safe_edit(event, card("⚙️ تنظیمات TRX", rows), buttons=btns)
+
+
+@bot.on(events.CallbackQuery(data=b"set_trx_override"))
+async def set_trx_override_cb(event):
+    if not is_owner(event):
+        return
+    current = db.get_setting("trx_price_override", "0")
+    state[event.sender_id] = {"step": "await_trx_override"}
+    await safe_edit(event,
+                    f"🔧 مقدار فعلی اورراید: {current} USD\n"
+                    f"قیمت جدید TRX رو بفرست (عدد). برای غیرفعال کردن 0 بفرست:",
+                    buttons=[[Button.inline("🔙 لغو", b"trx_settings")]])
+
+
+@bot.on(events.CallbackQuery(data=b"set_tolerance"))
+async def set_tolerance_cb(event):
+    if not is_owner(event):
+        return
+    current = db.get_setting("payment_tolerance_percent",
+                             str(config.PAYMENT_TOLERANCE_PERCENT))
+    state[event.sender_id] = {"step": "await_tolerance"}
+    await safe_edit(event,
+                    f"📏 تلرانس فعلی: {current}%\n"
+                    f"درصد تلرانس جدید رو بفرست (0 تا 50):",
+                    buttons=[[Button.inline("🔙 لغو", b"trx_settings")]])
+
+
+# --------------------------------------------------------------------------- #
+# Transaction List.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"txlist"))
+async def transactions_cb(event):
+    if not is_owner(event):
+        return
+    await _show_transactions(event, offset=0)
+
+
+@bot.on(events.CallbackQuery(pattern=b"txlist_(\\d+)"))
+async def transactions_page_cb(event):
+    if not is_owner(event):
+        return
+    offset = int(event.pattern_match.group(1))
+    await _show_transactions(event, offset=offset)
+
+
+async def _show_transactions(event, offset: int = 0):
+    all_payments = db.list_payments()
+    page_size = 20
+    page = all_payments[offset:offset + page_size]
+
+    if not all_payments:
+        await safe_edit(event, "📋 هنوز تراکنشی ثبت نشده.",
+                        buttons=[[Button.inline("🔙 بازگشت", b"home")]])
+        return
+
+    rows = [f"📋 تراکنش‌ها ({offset + 1}-{offset + len(page)} از {len(all_payments)}):"]
+    for p in page:
+        cid = p.get("customer_id", "?")
+        plan = p.get("plan", "?")
+        amount = float(p.get("amount", 0))
+        date = (p.get("created_at") or "")[:10]
+        rows.append(f"  {cid} | {plan} | {amount:g} TRX | {date}")
+
+    btns = []
+    nav_row = []
+    if offset > 0:
+        nav_row.append(Button.inline("⬅️ قبلی", f"txlist_{max(0, offset - page_size)}".encode()))
+    if offset + page_size < len(all_payments):
+        nav_row.append(Button.inline("➡️ بعدی", f"txlist_{offset + page_size}".encode()))
+    if nav_row:
+        btns.append(nav_row)
+    btns.append([Button.inline("🔙 بازگشت", b"home")])
+
+    await safe_edit(event, "\n".join(rows), buttons=btns)
 
 
 # --------------------------------------------------------------------------- #
@@ -584,8 +768,17 @@ async def text_router(event):
     elif step == "await_search":
         await _handle_search(event)
     elif step == "await_broadcast":
+        await _handle_broadcast_preview(event)
+    elif step == "await_broadcast_confirm":
+        # If user types anything during confirm step, treat as cancel
         state.pop(event.sender_id, None)
-        await do_broadcast(event, event.raw_text.strip())
+        await event.respond("لغو شد. از دکمه‌ها استفاده کن.", buttons=main_menu())
+    elif step == "await_price_input":
+        await _handle_price_input(event, st)
+    elif step == "await_trx_override":
+        await _handle_trx_override(event)
+    elif step == "await_tolerance":
+        await _handle_tolerance(event)
     elif step in ("w_ip", "w_port", "w_user", "w_pass"):
         await _worker_add_flow(event, st)
 
@@ -649,6 +842,86 @@ async def _handle_search(event):
         await event.respond("چیزی پیدا نشد.", buttons=main_menu())
         return
     await event.respond(f"🔎 {len(results)} نتیجه:", buttons=_cust_buttons(results))
+
+
+async def _handle_broadcast_preview(event):
+    """Show broadcast preview with count before sending."""
+    text = event.raw_text.strip()
+    if not text:
+        await event.respond("متن خالیه.", buttons=main_menu())
+        state.pop(event.sender_id, None)
+        return
+    customers = db.list_customers()
+    count = len(customers)
+    state[event.sender_id] = {"step": "await_broadcast_confirm", "broadcast_text": text}
+    await event.respond(
+        f"📣 {count} نفر دریافت می‌کنند. ادامه بده؟",
+        buttons=[
+            [Button.inline("✅ ارسال", b"broadcast_confirm"),
+             Button.inline("❌ لغو", b"broadcast_cancel")],
+        ]
+    )
+
+
+async def _handle_price_input(event, st):
+    plan_key = st.get("plan_key")
+    state.pop(event.sender_id, None)
+    txt = event.raw_text.strip()
+    try:
+        new_price = float(txt)
+        if new_price <= 0:
+            raise ValueError("price must be positive")
+    except (TypeError, ValueError):
+        await event.respond("عدد نامعتبره. لطفا یک عدد مثبت بفرست.", buttons=main_menu())
+        return
+    db.set_plan_price(plan_key, new_price)
+    plan_title = config.PLANS.get(plan_key, {}).get("title", plan_key)
+    central_db.audit("set_plan_price", f"{plan_key}={new_price}")
+    await logbus.to_group(card("💲 PRICE CHANGE", [
+        f"📦 {plan_title}", f"💲 قیمت جدید: {new_price:g} USD", f"🕒 {now()}"]))
+    await event.respond(f"✅ قیمت {plan_title} به {new_price:g} USD تغییر کرد.",
+                        buttons=main_menu())
+
+
+async def _handle_trx_override(event):
+    state.pop(event.sender_id, None)
+    txt = event.raw_text.strip()
+    try:
+        value = float(txt)
+        if value < 0:
+            raise ValueError("cannot be negative")
+    except (TypeError, ValueError):
+        await event.respond("عدد نامعتبره.", buttons=main_menu())
+        return
+    db.set_setting("trx_price_override", str(value))
+    central_db.audit("set_trx_override", f"{value}")
+    if value > 0:
+        await logbus.to_group(card("⚙️ TRX OVERRIDE", [
+            f"💲 قیمت: {value:g} USD", f"🕒 {now()}"]))
+        await event.respond(f"✅ اورراید قیمت TRX به {value:g} USD تنظیم شد.",
+                            buttons=main_menu())
+    else:
+        await logbus.to_group(card("⚙️ TRX OVERRIDE OFF", [f"🕒 {now()}"]))
+        await event.respond("✅ اورراید قیمت TRX غیرفعال شد (از CoinGecko استفاده می‌شه).",
+                            buttons=main_menu())
+
+
+async def _handle_tolerance(event):
+    state.pop(event.sender_id, None)
+    txt = event.raw_text.strip()
+    try:
+        value = float(txt)
+        if value < 0 or value > 50:
+            raise ValueError("must be 0-50")
+    except (TypeError, ValueError):
+        await event.respond("عدد نامعتبره (بین 0 تا 50 درصد).", buttons=main_menu())
+        return
+    db.set_setting("payment_tolerance_percent", str(value))
+    central_db.audit("set_tolerance", f"{value}%")
+    await logbus.to_group(card("⚙️ TOLERANCE CHANGE", [
+        f"📏 تلرانس جدید: {value:g}%", f"🕒 {now()}"]))
+    await event.respond(f"✅ تلرانس پرداخت به {value:g}% تغییر کرد.",
+                        buttons=main_menu())
 
 
 # --------------------------------------------------------------------------- #
