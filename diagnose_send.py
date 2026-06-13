@@ -43,9 +43,49 @@ run, AND the delay sweep). Just: TEST_PHONE=... python3 diagnose_send.py
 """
 import asyncio
 import os
+import subprocess
 import sys
 import time
 import types
+
+# --------------------------------------------------------------------------- #
+# Self-bootstrap: if the engine deps (rubpy/httpx) aren't installed for THIS
+# interpreter, install them once (from requirements.txt if present) and re-exec.
+# This makes the diagnostic "everything in one file" — no manual pip needed.
+# (For a REMOTE account it's still best to run INSIDE the worker container,
+#  where rubpy + the session already exist; see the header notes.)
+# --------------------------------------------------------------------------- #
+def _bootstrap_deps():
+    if os.getenv("DIAG_BOOTSTRAPPED") == "1":
+        return  # already tried once — don't loop forever
+    missing = []
+    for mod in ("rubpy", "httpx"):
+        try:
+            __import__(mod)
+        except Exception:  # noqa: BLE001
+            missing.append(mod)
+    if not missing:
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    req = os.path.join(here, "requirements.txt")
+    print(f"📦 ماژول‌های لازم نصب نیستن: {missing} — نصب خودکار ...")
+    cmd = [sys.executable, "-m", "pip", "install", "-q"]
+    cmd += (["-r", req] if os.path.exists(req)
+            else ["rubpy", "httpx", "python-dotenv"])
+    try:
+        subprocess.check_call(cmd)
+    except Exception as e:  # noqa: BLE001
+        print(f"❌ نصب خودکار نشد: {e!r}\n"
+              "   دستی نصب کن:  pip3 install -r requirements.txt\n"
+              "   یا اگه اکانت روی ورکره، داخل کانتینر اجرا کن:\n"
+              "   docker exec -e TEST_PHONE=... -it v2rubby-worker python3 diagnose_send.py")
+        sys.exit(1)
+    os.environ["DIAG_BOOTSTRAPPED"] = "1"  # inherited by the re-exec'd process
+    print("🔁 نصب شد؛ اسکریپت دوباره اجرا می‌شه ...")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_bootstrap_deps()
 
 # --------------------------------------------------------------------------- #
 # Make this diagnostic self-sufficient: config.py does `from dotenv import
