@@ -61,6 +61,8 @@ active_jobs: set = set()
 pv_export_jobs: set = set()
 # customers who pressed "stop" on their running PV export (collect-so-far)
 pv_export_stop: set = set()
+# pending Rubika worker-transfer relogins: uid -> {"aid": int}
+pending_xfer: dict = {}
 
 
 def now() -> str:
@@ -271,6 +273,7 @@ async def cancel_cb(event):
         except Exception:
             pass
     state.pop(uid, None)
+    pending_xfer.pop(uid, None)
     await _respond(event, "لغو شد.", buttons=main_menu())
 
 
@@ -629,7 +632,26 @@ async def help_cb(event):
     )
     await _respond(event, text,
                    buttons=[[Button.inline("📌 راهنمای مارکر", b"help_marker")],
+                            [Button.inline("🔄 انتقال ورکر", b"help_xfer")],
                             [Button.inline("🔙 بازگشت", b"home")]])
+
+
+@bot.on(events.CallbackQuery(data=b"help_xfer"))
+async def help_xfer_cb(event):
+    if not await _gate(event, need_active=False):
+        return
+    await _respond(event, card("🔄 راهنمای انتقالِ ورکر", [
+        "بعد از افزودنِ هر اکانت، ربات خودکار یه «تستِ ارسال» به چند مخاطب می‌زنه",
+        "تا مطمئن شه ارسالِ این سرور سالمه.",
+        LINE,
+        "✅ اگه موفق بود: همون سرور خوبه، کاری لازم نیست.",
+        "⚠️ اگه سرور اجازهٔ ارسال نداد (مثلاً محدودیتِ آی‌پی / TOO_REQUESTS):",
+        "   دکمهٔ «🔄 انتقال به ورکر دیگه و لاگین مجدد» میاد.",
+        "   با زدنش، اکانت به یه ورکرِ دیگه منتقل می‌شه و باید **دوباره** با",
+        "   شماره و کد لاگین کنی (سشنِ ورکرِ قبلی هم تمیز بسته می‌شه).",
+        LINE,
+        "ℹ️ این قابلیت وقتی کار می‌کنه که ورکرِ سالمِ دیگه‌ای موجود باشه.",
+    ]), buttons=[[Button.inline("🔙 بازگشت", b"help")]])
 
 
 @bot.on(events.CallbackQuery(data=b"help_marker"))
@@ -681,13 +703,18 @@ async def handle_phone(event, st):
 
     # Choose the least-loaded healthy worker (the local master may be chosen if
     # enabled). The chosen worker is persisted in the login state so the SAME
-    # worker handles phone -> code -> optional 2FA password.
-    try:
-        w = await worker.pick_worker_for_login()
-    except Exception:  # noqa: BLE001
-        w = None
-    if not w:
-        w = worker.ensure_master_worker()
+    # worker handles phone -> code -> optional 2FA password.  A worker-transfer
+    # relogin forces a specific (new) worker via st["force_worker"].
+    forced = st.get("force_worker")
+    if forced:
+        w = forced
+    else:
+        try:
+            w = await worker.pick_worker_for_login()
+        except Exception:  # noqa: BLE001
+            w = None
+        if not w:
+            w = worker.ensure_master_worker()
     st["worker"] = w
 
     # ----- REMOTE worker login relay -----
@@ -824,6 +851,7 @@ async def handle_code(event, st):
             f"👥 مخاطبین : {contacts}",
             f"🖥 Worker : {w.get('tag') or w.get('id')}",
             f"🕒 {now()}"], pv_user=uid)
+        await _rubika_post_add(uid, aid, phone, w)
         return
 
     # ----- LOCAL (master-as-worker): unchanged in-process flow -----
@@ -866,6 +894,214 @@ async def handle_code(event, st):
         f"👥 مخاطبین : {stats.get('contacts', 0)}",
         f"🖥 Worker : {w.get('tag') or w.get('id')}",
         f"🕒 {now()}"], pv_user=uid)
+    await _rubika_post_add(uid, aid, phone, w)
+
+
+# --------------------------------------------------------------------------- #
+# Rubika send-test (probe) after add + worker transfer.
+# --------------------------------------------------------------------------- #
+async def _local_session_delete(phone):
+    """Close + delete the LOCAL session file(s) for a phone on the master."""
+    import glob
+    phone = rb.normalize_phone(phone)
+    try:
+        await account_conn.close(phone)
+    except Exception:
+        pass
+    try:
+        for f in glob.glob(rb.session_path(phone) + "*"):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+async def _local_terminate_bots(phone):
+    """Terminate OTHER bot sessions (PWA + file-path device) from the local
+    master, without touching the customer's real phone/app session."""
+    async def _do(client):
+        terminated = 0
+        try:
+            res = await client.get_my_sessions()
+            data = None
+            for attr in ("to_dict", "original_update"):
+                obj = getattr(res, attr, None)
+                if callable(obj):
+                    try:
+                        data = obj()
+                        break
+                    except Exception:
+                        pass
+                elif obj is not None:
+                    data = obj
+                    break
+            for s in ((data or {}).get("other_sessions") or []):
+                dev = str(s.get("device") or "")
+                app_type = str(s.get("app_type") or "").lower()
+                key = s.get("key")
+                is_bot = app_type == "pwa" and (dev.startswith("/") or "acc_" in dev)
+                if key and s.get("terminatable", True) and is_bot:
+                    try:
+                        await client.terminate_session(key)
+                        terminated += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return terminated
+    try:
+        return await account_conn.call(phone, _do, timeout=120)
+    except Exception:
+        return 0
+
+
+async def _run_send_probe(uid, phone, w, marker, count):
+    """Forward the marker to a few contacts to verify the worker/IP can send.
+    Runs on the remote worker (/sendprobe) or in-process for a local account."""
+    if w and not worker.is_local(w):
+        try:
+            return await worker.api_call(w, "POST", "/sendprobe",
+                                         {"phone": phone, "marker": marker,
+                                          "count": count}, timeout=300)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": repr(e)[:140]}
+
+    async def _do(client):
+        saved_guid, mid = await rb.find_marked_message(
+            client, marker or config.FORWARD_MARKER)
+        if not mid:
+            return {"ok": False, "error": "marker_not_found"}
+        ordered, _stats = await rb.get_ordered_recipients(client)
+        targets = [r["guid"] for r in ordered][:max(1, int(count))]
+        sent = too = other = 0
+        for guid in targets:
+            try:
+                await asyncio.wait_for(
+                    rb.forward_message(client, saved_guid, guid, mid),
+                    timeout=config.SEND_TIMEOUT)
+                sent += 1
+            except Exception as e:  # noqa: BLE001
+                if "too_requests" in repr(e).lower():
+                    too += 1
+                else:
+                    other += 1
+        return {"ok": True, "sent": sent, "too_requests": too,
+                "other": other, "total": len(targets)}
+    try:
+        return await account_conn.call(phone, _do, timeout=300)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": repr(e)[:140]}
+
+
+async def _rubika_post_add(uid, aid, phone, w):
+    """After a Rubika account logs in: if this was a transfer, terminate the old
+    worker's session from the NEW worker; then auto-run a send-test and, if the
+    server is blocked, offer to transfer to another worker."""
+    xfer = pending_xfer.pop(uid, None)
+    if xfer:
+        try:
+            if w and not worker.is_local(w):
+                await worker.api_call(w, "POST", "/session/terminate_bots",
+                                      {"phone": phone}, timeout=120)
+            else:
+                await _local_terminate_bots(phone)
+        except Exception as e:  # noqa: BLE001
+            await _worker_error(uid, "بستن سشن قدیمی روی ورکر جدید", e, phone)
+
+    if not config.RB_SENDPROBE_ENABLED:
+        return
+    marker = db.get_marker(uid)
+    try:
+        pm = await bot.send_message(uid, "🧪 در حال تستِ ارسالِ این سرور (تا ۳ مخاطب) ...")
+    except Exception:
+        pm = None
+    res = await _run_send_probe(uid, phone, w, marker, config.RB_SENDPROBE_COUNT)
+    sent = int(res.get("sent") or 0)
+    too = int(res.get("too_requests") or 0)
+    err = res.get("error")
+
+    buttons = None
+    if res.get("ok") and too == 0 and sent > 0:
+        text = card("✅ تستِ ارسال موفق", [
+            f"📱 {phone}", f"✅ {sent} ارسالِ موفق",
+            "این سرور برای ارسال سالمه."])
+        await logbus.event("✅ RB SEND PROBE OK", [
+            f"🆔 {uid}", f"📱 {phone}", f"✅ {sent}", f"🕒 {now()}"])
+    elif err == "marker_not_found":
+        text = card("🧪 تست انجام نشد", [
+            f"📱 {phone}",
+            "پیامِ مارکر پیدا نشد.",
+            "بعد از تنظیمِ «📌 مارکر» و گذاشتنِ پیامِ مارکر تو Saved Messages، "
+            "ارسال تست واقعی می‌شه."])
+    else:
+        reason = (f"🚫 {too} بار TOO_REQUESTS" if too
+                  else f"💥 {err or 'ارسال ناموفق'}")
+        text = card("⚠️ ارسالِ این سرور مشکل داره", [
+            f"📱 {phone}", reason,
+            "احتمالاً محدودیتِ آی‌پیِ این سرور. می‌تونی اکانت رو به ورکر دیگه "
+            "منتقل کنی و دوباره لاگین کنی."])
+        buttons = [[Button.inline("🔄 انتقال به ورکر دیگه و لاگین مجدد",
+                                  f"rbxfer_{aid}".encode())]]
+        await logbus.event("⚠️ RB SEND PROBE FAILED", [
+            f"🆔 {uid}", f"📱 {phone}", f"🚫 too={too}  ✅ sent={sent}",
+            f"💥 {err or '-'}", f"🕒 {now()}"], pv_user=uid)
+
+    try:
+        if pm is not None:
+            await pm.edit(text, buttons=buttons)
+        else:
+            await bot.send_message(uid, text, buttons=buttons)
+    except Exception:
+        try:
+            await bot.send_message(uid, text, buttons=buttons)
+        except Exception:
+            pass
+
+
+@bot.on(events.CallbackQuery(pattern=b"rbxfer_(\\d+)"))
+async def rbxfer_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account_owned(aid, uid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    old_w = worker.worker_for_account(acc)
+    old_id = old_w.get("id") if old_w else None
+    try:
+        new_w = await worker.pick_worker_for_login(exclude_id=old_id)
+    except Exception:  # noqa: BLE001
+        new_w = None
+    if not new_w:
+        await _respond(event, card("🔄 انتقال به ورکر دیگه", [
+            "الان ورکرِ سالمِ دیگه‌ای برای انتقال نیست.",
+            "اول یه ورکرِ دیگه (مثلاً با آی‌پی ایران) اضافه کن."]),
+            buttons=[[Button.inline("🔙 بازگشت", b"home")]])
+        return
+    phone = acc["phone"]
+    # delete the OLD worker's session so it can never use this account again
+    try:
+        if old_w and not worker.is_local(old_w):
+            await worker.api_call(old_w, "POST", "/session/delete",
+                                  {"phone": phone}, timeout=60)
+        else:
+            await _local_session_delete(phone)
+    except Exception as e:  # noqa: BLE001
+        await _worker_error(uid, "حذف سشن روی ورکر قدیمی", e, phone)
+
+    db.set_account_worker(aid, new_w.get("id"))
+    pending_xfer[uid] = {"aid": aid}
+    state[uid] = {"step": "await_phone", "force_worker": new_w, "xfer_aid": aid}
+    await _respond(event, card("🔄 انتقال به ورکر دیگه", [
+        f"📱 {phone}",
+        f"🖥 ورکرِ جدید : {new_w.get('tag') or new_w.get('id')}",
+        LINE,
+        "حالا شمارهٔ همون اکانت رو دوباره بفرست تا روی ورکرِ جدید لاگین شه.",
+    ]), buttons=[[Button.inline("🔙 لغو", b"cancel")]])
 
 
 # --------------------------------------------------------------------------- #
