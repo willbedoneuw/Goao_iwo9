@@ -676,6 +676,15 @@ def deduct_balance(telegram_id: int, amount: float) -> bool:
 # =========================================================================== #
 # Deposits (TRX deposits with unique tx_hash).
 # =========================================================================== #
+def deposit_exists(tx_hash: str) -> bool:
+    """Check if a deposit with this tx_hash already exists."""
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM deposits WHERE tx_hash = ?",
+                       (str(tx_hash),)).fetchone()
+    conn.close()
+    return bool(row)
+
+
 def record_deposit(telegram_id: int, tx_hash: str, trx_amount: float) -> bool:
     """Record a TRX deposit. Returns False if tx_hash already used (anti-fraud)."""
     conn = _conn()

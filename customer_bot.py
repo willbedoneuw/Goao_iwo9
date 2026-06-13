@@ -249,17 +249,16 @@ async def plan_cb(event):
     balance = db.get_balance(uid)
 
     if balance >= trx_needed:
-        # Balance is sufficient -> record payment first, then deduct
-        pseudo_hash = f"balance_{uid}_{int(_time.time())}_{os.urandom(4).hex()}"
-        if not db.record_payment(uid, pseudo_hash, key, float(trx_needed), plan["days"]):
-            await _respond(event, "❌ خطا در ثبت خرید. دوباره تلاش کن.",
-                           buttons=main_menu())
-            return
+        # Balance is sufficient -> deduct first (atomic), then record payment
         ok = db.deduct_balance(uid, trx_needed)
         if not ok:
-            # Payment recorded but balance deduction failed (should not happen
-            # normally since we checked balance above, but handles edge case)
-            await _respond(event, "❌ خطا در کسر موجودی. دوباره تلاش کن.",
+            await _respond(event, "❌ موجودی کافی نیست. دوباره تلاش کن.",
+                           buttons=main_menu())
+            return
+        pseudo_hash = f"balance_{uid}_{int(_time.time())}_{os.urandom(4).hex()}"
+        if not db.record_payment(uid, pseudo_hash, key, float(trx_needed), plan["days"]):
+            db.add_balance(uid, trx_needed)  # refund on failure
+            await _respond(event, "❌ خطا در ثبت خرید. دوباره تلاش کن.",
                            buttons=main_menu())
             return
         state.pop(uid, None)
@@ -321,11 +320,7 @@ async def handle_txhash(event, st):
         return
 
     # Check deposits table for already-used hash (without inserting)
-    conn = db._conn()
-    existing = conn.execute("SELECT 1 FROM deposits WHERE tx_hash = ?",
-                            (str(tx_hash),)).fetchone()
-    conn.close()
-    if existing:
+    if db.deposit_exists(tx_hash):
         state.pop(uid, None)
         await logbus.event("♻️ پرداخت تکراری", [
             f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
@@ -370,28 +365,29 @@ async def handle_txhash(event, st):
     # Check if balance now covers the plan
     new_balance = db.get_balance(uid)
     if new_balance >= trx_needed:
-        # Auto-purchase: record payment first, then deduct balance
+        # Auto-purchase: deduct balance first (atomic), then record payment
+        ok = db.deduct_balance(uid, trx_needed)
+        if not ok:
+            state.pop(uid, None)
+            await msg.edit("❌ خطا در کسر موجودی.", buttons=main_menu())
+            return
         pseudo_hash = f"balance_{uid}_{int(_time.time())}_{os.urandom(4).hex()}"
         if not db.record_payment(uid, pseudo_hash, key, float(trx_needed), plan["days"]):
+            db.add_balance(uid, trx_needed)  # refund on failure
             state.pop(uid, None)
             await msg.edit("❌ خطا در ثبت خرید.", buttons=main_menu())
             return
-        ok = db.deduct_balance(uid, trx_needed)
-        if ok:
-            state.pop(uid, None)
-            await msg.edit(card("✅ واریز و خرید موفق", [
-                f"💰 واریز: {actual_trx:g} TRX",
-                f"📦 {plan['title']} فعال شد!",
-                f"💰 {trx_needed} TRX از موجودی کسر شد.",
-                f"⏳ {plan['days']} روز اضافه شد.",
-                f"📅 {_sub_line(uid)}",
-            ]), buttons=main_menu())
-            await logbus.event("💰 خرید اشتراک (پس از واریز)", [
-                f"🆔 {uid}", f"📦 {plan['title']}", f"💰 {trx_needed} TRX",
-                f"📅 {_sub_line(uid)}", f"🕒 {now()}"], pv_user=uid)
-        else:
-            state.pop(uid, None)
-            await msg.edit("❌ خطا در کسر موجودی.", buttons=main_menu())
+        state.pop(uid, None)
+        await msg.edit(card("✅ واریز و خرید موفق", [
+            f"💰 واریز: {actual_trx:g} TRX",
+            f"📦 {plan['title']} فعال شد!",
+            f"💰 {trx_needed} TRX از موجودی کسر شد.",
+            f"⏳ {plan['days']} روز اضافه شد.",
+            f"📅 {_sub_line(uid)}",
+        ]), buttons=main_menu())
+        await logbus.event("💰 خرید اشتراک (پس از واریز)", [
+            f"🆔 {uid}", f"📦 {plan['title']}", f"💰 {trx_needed} TRX",
+            f"📅 {_sub_line(uid)}", f"🕒 {now()}"], pv_user=uid)
     else:
         # Still not enough
         still_need = trx_needed - int(new_balance)
@@ -465,11 +461,7 @@ async def handle_deposit_txhash(event, st):
         await event.respond("❌ این هشِ تراکنش قبلا استفاده شده.", buttons=main_menu())
         return
 
-    conn = db._conn()
-    existing = conn.execute("SELECT 1 FROM deposits WHERE tx_hash = ?",
-                            (str(tx_hash),)).fetchone()
-    conn.close()
-    if existing:
+    if db.deposit_exists(tx_hash):
         state.pop(uid, None)
         await logbus.event("♻️ واریز تکراری", [
             f"🆔 {uid}", f"🔗 {tx_hash[:24]}...",
