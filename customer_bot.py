@@ -305,9 +305,10 @@ async def handle_txhash(event, st):
         await event.respond("پلن نامعتبر. دوباره از «خرید اشتراک» شروع کن.",
                             buttons=main_menu())
         return
-    tx_hash = event.raw_text.strip().split()[0] if event.raw_text.strip() else ""
+    tx_hash = tron.extract_tx_hash(event.raw_text or "")
     if not tx_hash:
-        await event.respond("هشِ تراکنش رو بفرست.")
+        await event.respond("هشِ تراکنش معتبر پیدا نشد. فقط هشِ ۶۴ کاراکتری تراکنش "
+                            "(یا لینک tronscan همون تراکنش) رو بفرست.")
         return
 
     # fast anti-fraud: reject an already-used hash before hitting the network
@@ -447,9 +448,10 @@ async def deposit_cb(event):
 async def handle_deposit_txhash(event, st):
     """Process a standalone TRX deposit (not tied to a specific plan)."""
     uid = event.sender_id
-    tx_hash = event.raw_text.strip().split()[0] if event.raw_text.strip() else ""
+    tx_hash = tron.extract_tx_hash(event.raw_text or "")
     if not tx_hash:
-        await event.respond("هشِ تراکنش رو بفرست.")
+        await event.respond("هشِ تراکنش معتبر پیدا نشد. فقط هشِ ۶۴ کاراکتری تراکنش "
+                            "(یا لینک tronscan همون تراکنش) رو بفرست.")
         return
 
     # anti-fraud: reject already-used hash (check without inserting)

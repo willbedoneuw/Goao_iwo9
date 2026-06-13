@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import re
 import time
 
 import httpx
@@ -37,6 +38,24 @@ import logbus
 _price_cache: dict = {"price": 0.0, "ts": 0.0}
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+# A TRON transaction hash is exactly 64 hexadecimal characters.
+_TX_HASH_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def extract_tx_hash(text: str) -> str:
+    """Extract a 64-char hex TRON tx hash from arbitrary user input.
+
+    Customers often paste a full tronscan URL (e.g.
+    https://tronscan.org/#/transaction/<hash>) or a '0x'-prefixed value instead
+    of the bare hash. We strip a leading '0x' and pull the first 64-hex run we
+    find, so both a raw hash AND a pasted link/URL work. Returns '' if none.
+    """
+    if not text:
+        return ""
+    cleaned = text.strip().replace("0x", "").replace("0X", "")
+    m = _TX_HASH_RE.search(cleaned)
+    return m.group(0).lower() if m else ""
 
 
 # --------------------------------------------------------------------------- #
