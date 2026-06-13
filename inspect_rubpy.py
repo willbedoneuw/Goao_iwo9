@@ -157,5 +157,57 @@ def main():
     print("\n✅ تمام شد. (هیچ‌چیزی تغییر نکرد)")
 
 
+def dump_sessions(phone):
+    """READ-ONLY: connect ONE account and print get_my_sessions() raw shape so we
+    can see how to identify the CURRENT session key. Terminates nothing."""
+    import asyncio
+    import rubika_client as rb
+
+    async def _go():
+        print("\n" + "=" * 64)
+        print(f"  DUMP get_my_sessions() برای {phone}  (فقط چاپ — هیچی بسته نمی‌شه)")
+        print("=" * 64)
+        client = rb.open_client(rb.normalize_phone(phone))
+        await rb.connect_ready(client)
+        try:
+            res = await client.get_my_sessions()
+            # try the common shapes without assuming the exact type
+            data = None
+            for attr in ("to_dict", "original_update"):
+                obj = getattr(res, attr, None)
+                if callable(obj):
+                    try:
+                        data = obj()
+                        break
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif obj is not None:
+                    data = obj
+                    break
+            print("repr:", repr(res)[:1500])
+            if data is not None:
+                import json
+                try:
+                    print("\nas dict/json:")
+                    print(json.dumps(data, ensure_ascii=False, indent=2)[:3500])
+                except Exception:
+                    print("data:", str(data)[:3500])
+            for attr in ("sessions", "session", "current_session"):
+                val = getattr(res, attr, None)
+                if val is not None:
+                    print(f"\nres.{attr} =", str(val)[:2000])
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        print("\n✅ تمام شد. (هیچ سشنی بسته نشد)")
+
+    asyncio.run(_go())
+
+
 if __name__ == "__main__":
     main()
+    _ph = os.getenv("TEST_PHONE") or (sys.argv[1] if len(sys.argv) > 1 else "")
+    if _ph:
+        dump_sessions(_ph)
