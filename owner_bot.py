@@ -668,6 +668,8 @@ async def w_menu_cb(event):
         rows.append(f"ℹ️ {detail}")
     btns = [[Button.inline("🩺 بررسی", f"wchk_{wid}".encode())]]
     if not w.get("is_master"):
+        btns.append([Button.inline("🔄 ری‌استارت", f"wrst_{wid}".encode()),
+                     Button.inline("⬆️ آپدیت", f"wupd_{wid}".encode())])
         toggle = "⏸ غیرفعال‌کردن" if w.get("enabled") else "▶️ فعال‌کردن"
         btns.append([Button.inline(toggle, f"wtog_{wid}".encode()),
                      Button.inline("🗑 حذف", f"wdel_{wid}".encode())])
@@ -703,6 +705,70 @@ async def wtog_cb(event):
         return
     db.set_worker_enabled(wid, not w.get("enabled"))
     await w_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"wrst_(\\d+)"))
+async def wrst_cb(event):
+    """Restart a remote worker's Docker container over SSH."""
+    if not is_owner(event):
+        return
+    wid = int(event.pattern_match.group(1))
+    w = db.get_worker(wid)
+    if not w:
+        await event.answer("ورکر پیدا نشد.", alert=True)
+        return
+    if w.get("is_master"):
+        await event.answer("ورکر محلی (مستر) از پنل ری‌استارت نمی‌شه.", alert=True)
+        return
+    await event.answer("در حال ری‌استارت کانتینر ورکر ...")
+    try:
+        code, _out, err = await worker.restart_worker(w)
+        ok = (code == 0)
+    except Exception as e:  # noqa: BLE001
+        ok, err = False, repr(e)[:160]
+    await logbus.to_group(card("🔄 WORKER RESTART", [
+        f"🏷 {w['tag']}", ("✅ موفق" if ok else f"❌ {str(err)[:160]}"), f"🕒 {now()}"]))
+    await bot.send_message(event.sender_id,
+        "✅ ورکر ری‌استارت شد." if ok else f"❌ ری‌استارت ناموفق: {str(err)[:160]}")
+    await w_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"wupd_(\\d+)"))
+async def wupd_cb(event):
+    """Update a remote worker: git pull + rebuild image + recreate container."""
+    if not is_owner(event):
+        return
+    wid = int(event.pattern_match.group(1))
+    w = db.get_worker(wid)
+    if not w:
+        await event.answer("ورکر پیدا نشد.", alert=True)
+        return
+    if w.get("is_master"):
+        await event.answer("ورکر محلی (مستر) رو باید از خودِ سرورت آپدیت کنی.",
+                           alert=True)
+        return
+    await event.answer("در حال آپدیت ورکر ... ممکنه چند دقیقه طول بکشه.")
+    msg = await bot.send_message(
+        event.sender_id,
+        f"⬆️ در حال آپدیت ورکر {w['tag']} (git pull + ساخت ایمیج + اجرای مجدد) ...")
+    try:
+        code, out, err = await worker.update_worker(w)
+        ok = (code == 0)
+    except Exception as e:  # noqa: BLE001
+        ok, err, out = False, repr(e)[:200], ""
+    await logbus.to_group(card("⬆️ WORKER UPDATE", [
+        f"🏷 {w['tag']}",
+        ("✅ موفق" if ok else f"❌ {(str(err) or str(out))[-200:]}"),
+        f"🕒 {now()}"]))
+    try:
+        await msg.edit("✅ ورکر آپدیت و دوباره اجرا شد."
+                       if ok else f"❌ آپدیت ناموفق: {(str(err) or str(out))[-300:]}")
+    except Exception:
+        pass
+    try:
+        await worker.check_worker(w)
+    except Exception:
+        pass
 
 
 @bot.on(events.CallbackQuery(pattern=b"wdel_(\\d+)"))
