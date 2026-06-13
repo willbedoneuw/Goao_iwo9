@@ -32,6 +32,7 @@ import account_conn
 import config
 import db
 import logbus
+import pdf_export
 import ratelimit
 import rubika_client as rb
 import tron
@@ -1482,61 +1483,136 @@ async def _safe_msg(uid, text, buttons=None):
         return None
 
 
-async def _send_pv_pdf(uid, phone, photos, scanned_chats, total_chats,
-                       progress_msg=None):
-    """Shared tail of the PV export: build the (lighter) PDF on the master and
-    deliver it to the customer + the central group. Works for both paths."""
-    if not photos:
-        extra = ""
-        if scanned_chats is not None:
-            extra = f"\n(چت‌های اسکن‌شده: {scanned_chats} از {total_chats})"
-        await _safe_send(uid, f"ℹ️ هیچ عکسی در پیوی‌های {phone} پیدا نشد.{extra}")
-        return
+class _PvDelivery:
+    """Collects prepared (lighter) JPEGs and delivers CUMULATIVE PDFs to the
+    customer: a new PDF every PV_EXPORT_PDF_BATCH photos (PDF #1 = first 20,
+    PDF #2 = first 40, ...), and a final COMPLETE PDF (also logged to the central
+    group). Shared by the local, remote and legacy paths so behaviour is
+    identical everywhere.
 
-    if progress_msg is not None:
+    Each photo is decoded/downscaled/re-encoded to a light JPEG exactly ONCE
+    (prepare_image), so rebuilding the cumulative PDF over and over stays cheap
+    and memory stays low (lighter than the raw blobs). Everything is sequential —
+    no parallel downloads/builds — to protect a small server."""
+
+    def __init__(self, uid, phone, progress_msg, where=""):
+        self.uid = uid
+        self.phone = phone
+        self.progress_msg = progress_msg
+        self.where = where            # title suffix on the progress card
+        self.jpegs = []               # prepared JPEG blobs (the cumulative archive)
+        self.sent = 0                 # photo count covered by the last PDF sent
+        self.seq = 0                  # customer-facing PDF counter
+        self._last_t = 0.0
+        self._last_n = -1
+
+    @property
+    def found(self):
+        return len(self.jpegs)
+
+    async def add(self, blob):
+        """Prepare ONE photo, and if we've crossed a batch boundary push a
+        cumulative PDF to the customer."""
+        jp = await asyncio.to_thread(
+            pdf_export.prepare_image, blob,
+            config.PV_EXPORT_PDF_QUALITY, config.PV_EXPORT_PDF_MAX_EDGE)
+        if not jp:
+            return
+        self.jpegs.append(jp)
+        batch = config.PV_EXPORT_PDF_BATCH
+        if batch and (len(self.jpegs) - self.sent) >= batch:
+            await self._deliver(final=False)
+
+    async def progress(self, scanned, total_chats, force=False):
+        if self.progress_msg is None or scanned is None:
+            return
+        t = _time.time()
+        n = len(self.jpegs)
+        # throttle: at most every ~3s, or whenever +25 new photos are found
+        if not force and (t - self._last_t < 3 and n - self._last_n < 25):
+            return
+        self._last_t = t
+        self._last_n = n
         try:
-            await progress_msg.edit(card("🖼 ساخت PDF", [
-                f"📱 {phone}",
-                f"🖼 {len(photos)} عکس جمع شد.",
-                "⏳ در حال ساخت و ارسال PDF ...",
-            ]))
+            await self.progress_msg.edit(card(f"🖼 در حال جمع‌آوری{self.where}", [
+                f"📱 {self.phone}",
+                f"💬 چت اسکن‌شده : {scanned}/{total_chats}",
+                f"🖼 عکس پیداشده : {n}",
+                f"📄 PDF ارسالی : {self.seq}",
+            ]), buttons=[[Button.inline("⛔ توقف و دریافت همینا", b"pvstop")]])
         except Exception:
             pass
 
-    import pdf_export
-    out_path = os.path.join(DATA_DIR, f"pv_{phone}_{int(datetime.now().timestamp())}.pdf")
-    try:
-        n = await asyncio.to_thread(pdf_export.build_pdf, photos, out_path)
-        rows = [f"🆔 {uid}", f"📱 {phone}"]
-        if scanned_chats is not None:
-            rows.append(f"💬 چت اسکن‌شده: {scanned_chats} از {total_chats}")
-        rows += [f"🖼 {n} عکس", f"🕒 {now()}"]
-        await logbus.event("🖼 PV IMAGE EXPORT", rows)
-        # the import-images file itself is logged to the central group
-        await logbus.to_group_file(out_path,
-                                   caption=f"🖼 فایل ایمپورت تصاویر — {phone} ({n})")
-        await bot.send_file(uid, out_path,
-                            caption=f"🖼 آرشیو عکس‌های پیویِ {phone} — {n} عکس",
-                            force_document=True)
-        await _safe_send(uid, "✅ آرشیو ارسال شد.")
-    except Exception as e:  # noqa: BLE001
-        await _safe_send(uid, f"❌ ساخت/ارسال PDF ناموفق: {repr(e)[:140]}")
-    finally:
+    async def _deliver(self, final):
+        n = len(self.jpegs)
+        if n == 0:
+            return
+        new_for_customer = n > self.sent
+        if not final and not new_for_customer:
+            return
+        out_path = os.path.join(
+            DATA_DIR,
+            f"pv_{self.phone}_{int(datetime.now().timestamp())}_{self.seq + 1}.pdf")
         try:
-            os.remove(out_path)
-        except Exception:
-            pass
+            built = await asyncio.to_thread(
+                pdf_export.build_pdf_from_jpegs, list(self.jpegs), out_path)
+            if new_for_customer:
+                self.seq += 1
+                tag = "نهایی" if final else "تجمیعی"
+                await bot.send_file(
+                    self.uid, out_path,
+                    caption=f"🖼 PDF شماره {self.seq} ({tag}) — {built} عکس از {self.phone}",
+                    force_document=True)
+            if final:
+                # only the COMPLETE archive is mirrored to the central log group
+                rows = [f"🆔 {self.uid}", f"📱 {self.phone}",
+                        f"🖼 {built} عکس", f"🕒 {now()}"]
+                await logbus.event("🖼 PV IMAGE EXPORT", rows)
+                await logbus.to_group_file(
+                    out_path,
+                    caption=f"🖼 فایل ایمپورت تصاویر — {self.phone} ({built})")
+            self.sent = n
+        except Exception as e:  # noqa: BLE001
+            await _safe_send(self.uid, f"❌ ساخت/ارسال PDF ناموفق: {repr(e)[:140]}")
+        finally:
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+
+    async def finish(self, scanned, total_chats, stopped):
+        """Send the final complete PDF (and log it). Tells the customer if no
+        photo was found."""
+        await self.progress(scanned, total_chats, force=True)
+        if self.found == 0:
+            extra = ""
+            if scanned is not None:
+                extra = f"\n(چت‌های اسکن‌شده: {scanned} از {total_chats})"
+            await _safe_send(self.uid,
+                             f"ℹ️ هیچ عکسی در پیوی‌های {self.phone} پیدا نشد.{extra}")
+            return
+        if stopped:
+            await _safe_send(
+                self.uid,
+                f"⛔ جمع‌آوری متوقف شد. {self.found} عکسِ جمع‌شده آماده می‌شه.")
+        if self.progress_msg is not None:
+            try:
+                await self.progress_msg.edit(card("🖼 ساخت PDF نهایی", [
+                    f"📱 {self.phone}",
+                    f"🖼 {self.found} عکس جمع شد.",
+                    "⏳ در حال ساخت و ارسال PDF نهایی ...",
+                ]))
+            except Exception:
+                pass
+        await self._deliver(final=True)
+        await _safe_send(self.uid, "✅ آرشیو کامل ارسال شد.")
 
 
-async def _run_pv_export_remote(uid, acc, w):
-    """REMOTE PV export: the worker collects the photos (base64) and the master
-    builds the PDF. Shows a 'collecting on worker' status and the final count."""
+async def _run_pv_export_remote_legacy(uid, acc, w, delivery):
+    """Fallback for workers that predate job-based export: use the old blocking
+    /pvexport/run, then feed the photos through the SAME cumulative delivery."""
+    import base64
     phone = acc["phone"]
-    progress_msg = await _safe_msg(uid, card("🖼 جمع‌آوری روی ورکر", [
-        f"📱 {phone}",
-        f"🖥 Worker : {w.get('tag') or w.get('id')}",
-        "⏳ در حال جمع‌آوری عکس‌ها روی ورکر ... (ممکنه چند دقیقه طول بکشه)",
-    ]))
     try:
         data = await worker.api_call(w, "POST", "/pvexport/run", {
             "phone": phone, "max_chats": config.PV_EXPORT_MAX_CHATS,
@@ -1549,14 +1625,89 @@ async def _run_pv_export_remote(uid, acc, w):
     if not data.get("ok"):
         await _safe_send(uid, f"❌ جمع‌آوری ناموفق: {str(data.get('error', ''))[:140]}")
         return
-    import base64
-    photos = []
     for b64 in data.get("photos_b64", []):
         try:
-            photos.append(base64.b64decode(b64))
+            blob = base64.b64decode(b64)
         except Exception:
             continue
-    await _send_pv_pdf(uid, phone, photos, None, None, progress_msg)
+        await delivery.add(blob)
+    await delivery.finish(None, None, False)
+
+
+async def _run_pv_export_remote(uid, acc, w):
+    """REMOTE PV export — RESILIENT job-based. The worker collects photos in the
+    background; the master polls, DRAINS photos incrementally (so a disconnect
+    can't lose what's already collected), shows live progress, honours the stop
+    button, and delivers cumulative PDFs. Falls back to the old blocking
+    /pvexport/run if the worker hasn't been updated yet (HTTP 404)."""
+    import base64
+    phone = acc["phone"]
+    pv_export_stop.discard(uid)
+    stop_btn = [[Button.inline("⛔ توقف و دریافت همینا", b"pvstop")]]
+    progress_msg = await _safe_msg(uid, card("🖼 جمع‌آوری روی ورکر", [
+        f"📱 {phone}",
+        f"🖥 Worker : {w.get('tag') or w.get('id')}",
+        "⏳ در حال جمع‌آوری عکس‌ها روی ورکر ...",
+    ]), buttons=stop_btn)
+    delivery = _PvDelivery(uid, phone, progress_msg, " (ورکر)")
+
+    # start the job; an old worker has no /pvexport/start -> 404 -> fallback
+    try:
+        start = await worker.api_call(w, "POST", "/pvexport/start", {
+            "phone": phone, "max_chats": config.PV_EXPORT_MAX_CHATS,
+            "max_photos": config.PV_EXPORT_MAX_PHOTOS,
+        }, timeout=60)
+        job_id = start.get("job_id")
+    except Exception as e:  # noqa: BLE001
+        if getattr(getattr(e, "response", None), "status_code", None) == 404:
+            await _run_pv_export_remote_legacy(uid, acc, w, delivery)
+            return
+        await _worker_error(uid, "شروع ایمپورت عکس روی ورکر", e, phone)
+        await _safe_send(uid, "❌ ارتباط با ورکر برای شروع ایمپورت برقرار نشد. بعداً دوباره تلاش کن.")
+        return
+    if not job_id:
+        await _safe_send(uid, "❌ ورکر job ایمپورت رو شروع نکرد.")
+        return
+
+    scanned = total_chats = 0
+    stopped = False
+    fails = 0
+    while True:
+        # forward the stop request to the worker if the customer pressed it
+        if uid in pv_export_stop:
+            try:
+                await worker.api_call(w, "POST", f"/pvexport/stop/{job_id}", timeout=30)
+            except Exception:
+                pass
+        try:
+            st = await worker.api_call(w, "GET", f"/pvexport/status/{job_id}", timeout=60)
+            fails = 0
+        except Exception as e:  # noqa: BLE001
+            # transient disconnect: the worker keeps collecting and the tunnel
+            # auto-reopens, so retry a few times before giving up with what we
+            # already drained (resilient to brief outages).
+            fails += 1
+            if fails >= config.PV_EXPORT_MAX_POLL_FAILS:
+                await _worker_error(uid, "دریافت پیشرفت ایمپورت از ورکر", e, phone)
+                break
+            await asyncio.sleep(config.PV_EXPORT_POLL_SEC)
+            continue
+        scanned = st.get("scanned", scanned)
+        total_chats = st.get("total_chats", total_chats)
+        for b64 in st.get("photos_b64", []):
+            try:
+                blob = base64.b64decode(b64)
+            except Exception:
+                continue
+            await delivery.add(blob)
+        await delivery.progress(scanned, total_chats)
+        if st.get("stopped"):
+            stopped = True
+        if st.get("done"):
+            break
+        await asyncio.sleep(config.PV_EXPORT_POLL_SEC)
+
+    await delivery.finish(scanned, total_chats, stopped)
 
 
 async def _run_pv_export(uid: int, acc):
@@ -1568,33 +1719,14 @@ async def _run_pv_export(uid: int, acc):
         await _run_pv_export_remote(uid, acc, w)
         return
 
-    # ----- LOCAL (master-as-worker) path with LIVE progress + STOP support -----
+    # ----- LOCAL (master-as-worker) path: live progress + stop + cumulative PDFs
     pv_export_stop.discard(uid)
     stop_btn = [[Button.inline("⛔ توقف و دریافت همینا", b"pvstop")]]
     progress_msg = await _safe_msg(uid, card("🖼 جمع‌آوری عکس‌های پیوی", [
         f"📱 {phone}", "⏳ شروع اسکن چت‌ها ..."]), buttons=stop_btn)
-    last_edit = {"t": 0.0, "n": -1}
-
-    async def _edit_progress(found, scanned, total_chats, force=False):
-        if progress_msg is None:
-            return
-        t = _time.time()
-        # throttle: at most every ~3s, or whenever +25 new photos are found
-        if not force and (t - last_edit["t"] < 3 and found - last_edit["n"] < 25):
-            return
-        last_edit["t"] = t
-        last_edit["n"] = found
-        try:
-            await progress_msg.edit(card("🖼 در حال جمع‌آوری", [
-                f"📱 {phone}",
-                f"💬 چت اسکن‌شده : {scanned}/{total_chats}",
-                f"🖼 عکس پیداشده : {found}",
-            ]), buttons=stop_btn)
-        except Exception:
-            pass
+    delivery = _PvDelivery(uid, phone, progress_msg, "")
 
     async def _do(client):
-        out = []
         guids = await rb.get_chat_list_guids(client, only_users=True)
         total_chats = len(guids)
         scanned = 0
@@ -1612,21 +1744,21 @@ async def _run_pv_export(uid: int, acc):
                     blob = await asyncio.wait_for(
                         rb.download_photo(client, fi),
                         timeout=config.PV_DOWNLOAD_TIMEOUT)
-                    if blob:
-                        out.append(blob)
-                        await _edit_progress(len(out), scanned, total_chats)
                 except Exception:
                     # timeout / decode / network error on ONE photo -> skip it
                     continue
-                if len(out) >= config.PV_EXPORT_MAX_PHOTOS:
-                    return out, total_chats, scanned, False
+                if blob:
+                    await delivery.add(blob)
+                    await delivery.progress(scanned, total_chats)
+                if delivery.found >= config.PV_EXPORT_MAX_PHOTOS:
+                    return total_chats, scanned, False
             if stopped:
                 break
-            await _edit_progress(len(out), scanned, total_chats)
-        return out, total_chats, scanned, stopped
+            await delivery.progress(scanned, total_chats)
+        return total_chats, scanned, stopped
 
     try:
-        photos, total_chats, scanned_chats, stopped = await account_conn.call(
+        total_chats, scanned_chats, stopped = await account_conn.call(
             phone, _do, timeout=1800)
     except account_conn.InvalidAuthError:
         db.set_status(acc["id"], "inactive")
@@ -1636,11 +1768,7 @@ async def _run_pv_export(uid: int, acc):
         await _safe_send(uid, f"❌ جمع‌آوری ناموفق: {repr(e)[:140]}")
         return
 
-    await _edit_progress(len(photos), scanned_chats, total_chats, force=True)
-    if stopped:
-        await _safe_send(uid,
-                         f"⛔ جمع‌آوری متوقف شد. {len(photos)} عکسِ جمع‌شده آماده می‌شه.")
-    await _send_pv_pdf(uid, phone, photos, scanned_chats, total_chats, progress_msg)
+    await delivery.finish(scanned_chats, total_chats, stopped)
 
 
 # --------------------------------------------------------------------------- #
