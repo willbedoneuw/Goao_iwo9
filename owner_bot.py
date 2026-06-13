@@ -488,7 +488,7 @@ async def set_tolerance_cb(event):
     state[event.sender_id] = {"step": "await_tolerance"}
     await safe_edit(event,
                     f"📏 تلرانس فعلی: {current}%\n"
-                    f"درصد تلرانس جدید رو بفرست (مثلا 5):",
+                    f"درصد تلرانس جدید رو بفرست (0 تا 50):",
                     buttons=[[Button.inline("🔙 لغو", b"trx_settings")]])
 
 
@@ -911,10 +911,10 @@ async def _handle_tolerance(event):
     txt = event.raw_text.strip()
     try:
         value = float(txt)
-        if value < 0 or value > 100:
-            raise ValueError("must be 0-100")
+        if value < 0 or value > 50:
+            raise ValueError("must be 0-50")
     except (TypeError, ValueError):
-        await event.respond("عدد نامعتبره (بین 0 تا 100).", buttons=main_menu())
+        await event.respond("عدد نامعتبره (بین 0 تا 50 درصد).", buttons=main_menu())
         return
     db.set_setting("payment_tolerance_percent", str(value))
     central_db.audit("set_tolerance", f"{value}%")
