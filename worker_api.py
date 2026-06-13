@@ -15,12 +15,18 @@ Endpoints (all require `Authorization: Bearer <WORKER_API_TOKEN>`):
   POST /send/start             -> {ok, job_id, total, marker_found}
   GET  /send/status/{job_id}   -> {ok, fail, total, done, stopped, reason}
   POST /send/stop/{job_id}     -> {stopped: true}
+  POST /pvexport/start         -> {ok, job_id}                 (resilient PV export)
+  GET  /pvexport/status/{job}  -> {done, stopped, scanned, total_chats, found,
+                                   photos_b64[]}  (drains new photos each call)
+  POST /pvexport/stop/{job}    -> {stopped: true}
 
 It binds to loopback only; the master maps a local port to it via SSH, so the
 API is never exposed to the public internet.
 """
 import asyncio
+import base64
 import random
+import time
 import uuid
 
 import account_conn
@@ -46,6 +52,7 @@ except ImportError:  # pragma: no cover
 # --------------------------------------------------------------------------- #
 _login_ctx: dict = {}   # phone -> rubpy login context dict
 _jobs: dict = {}        # job_id -> job state dict
+_pv_jobs: dict = {}     # job_id -> PV-export job state (resilient, drained by master)
 _automations: dict = {}  # phone -> automation state dict
 _secretaries: dict = {}  # phone -> secretary state dict
 _channelreports: dict = {}  # phone -> channel-report state dict
@@ -681,6 +688,49 @@ def _build_app():
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "count": 0, "error": repr(e)[:200]}
 
+    # ----- resilient (job-based) PV export -----------------------------------
+    # Unlike /pvexport/run (which downloads everything then returns one giant
+    # response — a single network blip loses ALL of it), this collects photos in
+    # the background and the master DRAINS them incrementally via /status. A
+    # disconnect can't lose photos already drained, and progress is live.
+    @app.post("/pvexport/start")
+    async def pvexport_start(body: PvExportIn, authorization: str = Header(None)):
+        _auth(authorization)
+        job_id = uuid.uuid4().hex[:12]
+        job = {"phone": body.phone, "photos": [], "scanned": 0, "total_chats": 0,
+               "found": 0, "done": False, "stopped": False, "error": None,
+               "ts": time.time()}
+        _pv_jobs[job_id] = job
+        asyncio.create_task(_run_pvexport(job, body))
+        return {"ok": True, "job_id": job_id}
+
+    @app.get("/pvexport/status/{job_id}")
+    async def pvexport_status(job_id: str, authorization: str = Header(None)):
+        _auth(authorization)
+        job = _pv_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        # Drain newly-collected photos (atomic: no await between read + reset).
+        drained = job["photos"]
+        job["photos"] = []
+        resp = {"ok": True, "scanned": job["scanned"],
+                "total_chats": job["total_chats"], "found": job["found"],
+                "done": job["done"], "stopped": job["stopped"],
+                "error": job["error"],
+                "photos_b64": [base64.b64encode(b).decode() for b in drained]}
+        # once finished AND fully drained, forget the job (keeps memory bounded)
+        if job["done"] and not job["photos"]:
+            _pv_jobs.pop(job_id, None)
+        return resp
+
+    @app.post("/pvexport/stop/{job_id}")
+    async def pvexport_stop(job_id: str, authorization: str = Header(None)):
+        _auth(authorization)
+        job = _pv_jobs.get(job_id)
+        if job:
+            job["stopped"] = True
+        return {"stopped": True}
+
     @app.get("/extras/logs")
     async def extras_logs(authorization: str = Header(None)):
         _auth(authorization)
@@ -690,6 +740,40 @@ def _build_app():
         return {"logs": logs}
 
     return app
+
+
+async def _run_pvexport(job: dict, body):
+    """Background PV-export collector. Mirrors the local collector but pushes
+    each downloaded photo into job['photos'] so the master can DRAIN them as it
+    polls. Honours job['stopped'] (collect-so-far) and per-photo timeout."""
+    async def _do(client):
+        guids = await rb.get_chat_list_guids(client, only_users=True)
+        job["total_chats"] = len(guids)
+        for g in guids[:body.max_chats]:
+            if job["stopped"]:
+                break
+            job["scanned"] += 1
+            async for _mid, fi in rb.iter_chat_photos(client, g):
+                if job["stopped"]:
+                    break
+                try:
+                    blob = await asyncio.wait_for(
+                        rb.download_photo(client, fi),
+                        timeout=config.PV_DOWNLOAD_TIMEOUT)
+                except Exception:
+                    # timeout / decode / network error on ONE photo -> skip it
+                    continue
+                if blob:
+                    job["photos"].append(blob)
+                    job["found"] += 1
+                if job["found"] >= body.max_photos:
+                    return
+    try:
+        await account_conn.call(job["phone"], _do, timeout=3600)
+    except Exception as e:  # noqa: BLE001
+        job["error"] = repr(e)[:200]
+    finally:
+        job["done"] = True
 
 
 async def _stop_automation(phone: str) -> int:

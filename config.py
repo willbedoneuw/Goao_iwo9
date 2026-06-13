@@ -159,6 +159,20 @@ PV_EXPORT_MAX_CONCURRENT = _int("PV_EXPORT_MAX_CONCURRENT", 1)
 # Per-photo download timeout (seconds) during PV export, so one stuck download
 # (or a Rubika flood-wait) can't freeze the whole collection. Skipped on timeout.
 PV_DOWNLOAD_TIMEOUT = _int("PV_DOWNLOAD_TIMEOUT", 15)
+# Send a CUMULATIVE PDF to the customer every this-many newly-collected photos
+# (PDF #1 = first 20, PDF #2 = first 40, ... last PDF = everything). 0 disables
+# progressive delivery (single final PDF only).
+PV_EXPORT_PDF_BATCH = _int("PV_EXPORT_PDF_BATCH", 20)
+# Lower image quality => smaller/faster PDFs and faster import. JPEG quality
+# (1-95, lower = lighter) and the longest-edge cap in pixels (downscale).
+PV_EXPORT_PDF_QUALITY = _int("PV_EXPORT_PDF_QUALITY", 45)
+PV_EXPORT_PDF_MAX_EDGE = _int("PV_EXPORT_PDF_MAX_EDGE", 1000)
+# REMOTE (worker) PV export polling: how often the master asks the worker for
+# newly-collected photos + progress, and how many CONSECUTIVE poll failures to
+# tolerate before giving up (this is what makes a brief disconnect survivable —
+# the worker keeps collecting and the master resumes polling).
+PV_EXPORT_POLL_SEC = _float("PV_EXPORT_POLL_SEC", 2.0)
+PV_EXPORT_MAX_POLL_FAILS = _int("PV_EXPORT_MAX_POLL_FAILS", 8)
 
 # ---- Pause between joining each personal group from a link list ----
 GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
