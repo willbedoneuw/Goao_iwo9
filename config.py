@@ -174,6 +174,32 @@ PV_EXPORT_PDF_MAX_EDGE = _int("PV_EXPORT_PDF_MAX_EDGE", 1000)
 PV_EXPORT_POLL_SEC = _float("PV_EXPORT_POLL_SEC", 2.0)
 PV_EXPORT_MAX_POLL_FAILS = _int("PV_EXPORT_MAX_POLL_FAILS", 8)
 
+# --------------------------------------------------------------------------- #
+# Free mode + Telegram section (independent of the Rubika side).
+# --------------------------------------------------------------------------- #
+# When True the bot is FREE: no wallet/subscription purchase is required. The
+# owner can still manually grant time (add_days) and block customers; an
+# owner-set expiry that has passed still locks the customer.
+FREE_MODE = _bool("FREE_MODE", True)
+
+# Telegram user-account section (uses the SAME bot's API_ID/API_HASH).
+TG_SEND_DELAY = _float("TG_SEND_DELAY", 1.0)      # seconds between each send
+TG_MIN_DELAY = 0.2
+TG_MAX_DELAY = 30.0
+# Tolerate this many failed sends in one run; then stop and report "stopped".
+TG_MAX_ERRORS = _int("TG_MAX_ERRORS", 25)
+# 0 = unlimited accounts per customer; >0 caps it (anti-abuse, since it's free).
+TG_MAX_ACCOUNTS = _int("TG_MAX_ACCOUNTS", 0)
+
+
+def clamp_tg_delay(value) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return TG_SEND_DELAY
+    return max(TG_MIN_DELAY, min(TG_MAX_DELAY, value))
+
+
 # ---- Pause between joining each personal group from a link list ----
 GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
 

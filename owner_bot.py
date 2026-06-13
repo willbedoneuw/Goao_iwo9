@@ -24,6 +24,8 @@ and the audit log.
 """
 import asyncio
 import os
+import time
+import zipfile
 
 from telethon import TelegramClient, events, Button
 
@@ -80,6 +82,7 @@ def main_menu():
          Button.inline("📋 تراکنش‌ها", b"txlist")],
         [Button.inline("🛠 ورکرها", b"workers"),
          Button.inline("🧰 تعمیر/بکاپ", b"sys")],
+        [Button.inline("📨 آمار تلگرام", b"tg_owner")],
     ]
 
 
@@ -556,6 +559,7 @@ async def sys_cb(event):
     ]), buttons=[
         [Button.inline("🛠 تغییر حالت تعمیر", b"maint_toggle")],
         [Button.inline("💾 بکاپ فوری", b"backup_now")],
+        [Button.inline("🗄 بکاپ کامل (سشن+محتوا+تنظیمات)", b"fullbackup")],
         [Button.inline("🔙 بازگشت", b"home")]])
 
 
@@ -579,6 +583,89 @@ async def backup_now_cb(event):
     ok = await backup.run_backup(notify_user=event.sender_id)
     if not ok:
         await bot.send_message(event.sender_id, "هنوز چیزی برای بکاپ نیست.")
+
+
+# --------------------------------------------------------------------------- #
+# Telegram section: owner stats (per-customer + content) + full backup.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"tg_owner"))
+async def tg_owner_cb(event):
+    if not is_owner(event):
+        return
+    accounts = db.list_tg_accounts()
+    # group by customer
+    by_cust = {}
+    for a in accounts:
+        by_cust.setdefault(a["customer_id"], []).append(a)
+    total_sends = 0
+    rows = [
+        f"📨 کل اکانت‌های تلگرام : {len(accounts)}",
+        f"👥 مشتری‌های دارای اکانت : {len(by_cust)}",
+        LINE,
+    ]
+    cust_names = {c["telegram_id"]: (c.get("name") or "-")
+                  for c in db.list_customers()}
+    shown = 0
+    for cid, accs in by_cust.items():
+        s = db.get_tg_settings(cid)
+        sends = int(s.get("total_sends") or 0)
+        total_sends += sends
+        if shown < 25:
+            content = "✅" if s.get("content_type") else "❌"
+            alive = sum(1 for a in accs if a.get("status") == "active")
+            rows.append(
+                f"🆔 {cid} ({cust_names.get(cid, '-')}) — "
+                f"📱{len(accs)} (🟢{alive}) — 📤{sends} — 📦{content}")
+            shown += 1
+    rows.insert(2, f"📤 کل ارسال‌های تلگرام : {total_sends}")
+    if len(by_cust) > 25:
+        rows.append(f"… و {len(by_cust) - 25} مشتری دیگه")
+    await safe_edit(event, card("📨 آمار تلگرام", rows),
+                    buttons=[[Button.inline("🔄 تازه‌سازی", b"tg_owner")],
+                             [Button.inline("🗄 بکاپ کامل", b"fullbackup")],
+                             [Button.inline("🔙 بازگشت", b"home")]])
+
+
+def _build_full_backup() -> str:
+    """Zip EVERYTHING the owner needs to restore: the customer DB (rubika+tg
+    accounts, customers, content/settings), the central DB, and the media +
+    session files. Returns the zip path."""
+    out = os.path.join(DATA_DIR, f"full_backup_{int(time.time())}.zip")
+    db_paths = [getattr(db, "DB_PATH", None), getattr(central_db, "DB_PATH", None)]
+    dirs = [os.path.join(DATA_DIR, "sessions"), os.path.join(DATA_DIR, "tg_media")]
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in db_paths:
+            if p and os.path.exists(p):
+                z.write(p, os.path.basename(p))
+        for d in dirs:
+            if os.path.isdir(d):
+                for root, _dirs, files in os.walk(d):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        z.write(fp, os.path.relpath(fp, DATA_DIR))
+    return out
+
+
+@bot.on(events.CallbackQuery(data=b"fullbackup"))
+async def fullbackup_cb(event):
+    if not is_owner(event):
+        return
+    await event.answer("در حال ساخت بکاپ کامل ...")
+    path = None
+    try:
+        path = await asyncio.to_thread(_build_full_backup)
+        await bot.send_file(event.sender_id, path,
+                            caption=f"🗄 بکاپ کامل (سشن + محتوا + تنظیمات) • {now()}",
+                            force_document=True)
+        await logbus.to_group(card("🗄 FULL BACKUP", [f"🕒 {now()}"]))
+    except Exception as e:  # noqa: BLE001
+        await bot.send_message(event.sender_id, f"❌ خطا در بکاپ کامل: {repr(e)[:140]}")
+    finally:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------- #
