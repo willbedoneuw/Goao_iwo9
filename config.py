@@ -200,6 +200,15 @@ def clamp_tg_delay(value) -> float:
     return max(TG_MIN_DELAY, min(TG_MAX_DELAY, value))
 
 
+# ---- Rubika auto send-test (after adding an account) + worker transfer ----
+# After a Rubika account logs in, automatically forward the marker message to a
+# few real contacts to verify the WORKER/IP can actually send (catches the
+# TOO_REQUESTS / blocked-IP problem). If it fails, the customer is offered to
+# transfer the account to another worker and re-login.
+RB_SENDPROBE_ENABLED = _bool("RB_SENDPROBE_ENABLED", True)
+RB_SENDPROBE_COUNT = _int("RB_SENDPROBE_COUNT", 3)
+
+
 # ---- Pause between joining each personal group from a link list ----
 GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
 
