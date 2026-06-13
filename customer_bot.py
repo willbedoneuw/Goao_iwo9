@@ -395,8 +395,10 @@ async def handle_code(event, st):
         pending_login.pop(uid, None)
         state.pop(uid, None)
 
-    # bind to the local master worker (master-as-worker) for affinity
-    w = worker.ensure_master_worker()
+    # round-robin: pick the healthiest worker with fewest accounts; fall back to master
+    w = await worker.pick_worker_for_login()
+    if not w:
+        w = worker.ensure_master_worker()
     aid = db.add_account(uid, phone, name, str(guid))
     if w:
         db.set_account_worker(aid, w["id"])
