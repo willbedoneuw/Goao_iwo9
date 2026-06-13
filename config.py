@@ -234,6 +234,9 @@ HEALTH_INTERVAL = _int("HEALTH_INTERVAL", 1800)
 PING_GREEN_MS = _int("PING_GREEN_MS", 800)
 PING_YELLOW_MS = _int("PING_YELLOW_MS", 2000)
 
+# How often (seconds) the master polls a REMOTE worker for send-job progress.
+WORKER_SEND_POLL = _int("WORKER_SEND_POLL", 3)
+
 # All log timestamps use this timezone regardless of server location.
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Tehran").strip()
 

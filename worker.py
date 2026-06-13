@@ -487,6 +487,178 @@ def worker_for_account(account: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Per-account job dispatch — the piece that actually DISTRIBUTES the work.
+#
+# Every per-account operation (login, prepare, send, verify, pv-export) must run
+# on the worker that OWNS the account, because that's where the Rubika session
+# file physically lives. For the LOCAL master we run rubika_client in-process;
+# for a REMOTE worker we relay over the authenticated SSH-tunnelled API. These
+# helpers are the SINGLE place that makes that decision, so the bots never have
+# to special-case "local vs remote" again.
+#
+# rubika_client / account_conn are imported lazily inside the local branch so
+# this module stays importable on machines without the Rubika deps.
+# --------------------------------------------------------------------------- #
+# Mid-login contexts for the LOCAL master only (keyed by normalized phone).
+_local_login: dict = {}
+
+
+async def login_start(worker: dict, phone: str, pass_key: str = None) -> dict:
+    """Begin a login on the account's worker.
+    -> {ok, status, needs_password, needs_code}."""
+    if is_local(worker):
+        import rubika_client as rb
+        ctx = await rb.start_login(phone, pass_key=pass_key)
+        _local_login[rb.normalize_phone(phone)] = ctx
+        status = str(ctx.get("status") or "").upper()
+        needs_password = "PASS" in status
+        needs_code = (not needs_password) and bool(ctx.get("phone_code_hash"))
+        return {"ok": True, "status": status,
+                "needs_password": needs_password, "needs_code": needs_code}
+    return await api_call(worker, "POST", "/login/start",
+                          {"phone": phone, "pass_key": pass_key})
+
+
+async def login_password(worker: dict, phone: str, password: str) -> dict:
+    """Submit the 2FA password (Rubika then re-sends the SMS code).
+    -> {ok, needs_code}."""
+    if is_local(worker):
+        import rubika_client as rb
+        ctx = await rb.start_login(phone, pass_key=password)
+        _local_login[rb.normalize_phone(phone)] = ctx
+        return {"ok": True, "needs_code": bool(ctx.get("phone_code_hash"))}
+    return await api_call(worker, "POST", "/login/password",
+                          {"phone": phone, "password": password})
+
+
+async def login_code(worker: dict, phone: str, code: str) -> dict:
+    """Finish the login with the SMS code; the session is SAVED ON THE WORKER.
+    -> {ok, name, guid, contacts, groups, with_chat, phone}."""
+    if is_local(worker):
+        import rubika_client as rb
+        key = rb.normalize_phone(phone)
+        ctx = _local_login.get(key)
+        if not ctx:
+            raise RuntimeError("no login in progress")
+        digits = "".join(ch for ch in code if ch.isdigit())
+        await rb.finish_login(ctx, digits)
+        client = ctx["client"]
+        try:
+            me = await client.get_me()
+            guid = rb._guid_of(me) or "-"
+            name = rb._name_of(me)
+            _ordered, stats = await rb.get_ordered_recipients(client)
+            return {"ok": True, "name": name, "guid": str(guid),
+                    "contacts": stats["contacts"], "groups": stats["groups"],
+                    "with_chat": stats["with_chat"], "phone": ctx["phone"]}
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            _local_login.pop(key, None)
+    return await api_call(worker, "POST", "/login/code",
+                          {"phone": phone, "code": code})
+
+
+async def login_cancel(worker: dict, phone: str):
+    """Best-effort cleanup of a half-finished login."""
+    if is_local(worker):
+        import rubika_client as rb
+        ctx = _local_login.pop(rb.normalize_phone(phone), None)
+        if ctx:
+            try:
+                await ctx["client"].disconnect()
+            except Exception:
+                pass
+    # Remote workers drop their context on the next attempt / on /login/code.
+
+
+async def prepare_send(worker: dict, phone: str, marker: str) -> dict:
+    """Find the marked message + recipient count on the OWNING worker.
+    -> {ok, marker_found, total, [saved_guid, mid, recipients]}.
+    The local master also returns the data needed to run the send in-process."""
+    if is_local(worker):
+        import account_conn
+        import rubika_client as rb
+        await account_conn.close(phone)
+        client = rb.open_client(phone)
+        try:
+            await rb.connect_ready(client)
+            saved_guid, mid = await rb.find_marked_message(client, marker)
+            if not mid:
+                return {"ok": True, "marker_found": False, "total": 0}
+            ordered, _stats = await rb.get_ordered_recipients(client)
+            recipients = [r["guid"] for r in ordered]
+            return {"ok": True, "marker_found": True, "total": len(recipients),
+                    "saved_guid": saved_guid, "mid": mid, "recipients": recipients}
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+    return await api_call(worker, "POST", "/prepare",
+                          {"phone": phone, "marker": marker})
+
+
+async def send_start(worker: dict, phone: str, marker: str, delay: float) -> dict:
+    """Launch a send job ON THE REMOTE WORKER.
+    -> {ok, marker_found, job_id, total}."""
+    return await api_call(worker, "POST", "/send/start", {
+        "phone": phone, "marker": marker, "delay": delay,
+        "max_errors": config.MAX_ERRORS, "send_timeout": config.SEND_TIMEOUT,
+        "resume_wait": config.RESUME_WAIT, "max_retries": config.RESUME_MAX_RETRIES,
+    })
+
+
+async def send_status(worker: dict, job_id: str) -> dict:
+    return await api_call(worker, "GET", f"/send/status/{job_id}", timeout=30)
+
+
+async def send_stop(worker: dict, job_id: str) -> dict:
+    return await api_call(worker, "POST", f"/send/stop/{job_id}", timeout=30)
+
+
+async def verify_session(worker: dict, phone: str) -> bool:
+    """True if the account's session is dead, checked on its OWNING worker."""
+    if is_local(worker):
+        import account_conn
+        return await account_conn.verify_session_dead(phone)
+    res = await api_call(worker, "POST", "/account/verify",
+                         {"phone": phone}, timeout=60)
+    return bool(res.get("dead"))
+
+
+async def pv_export(worker: dict, phone: str, max_chats: int,
+                    max_photos: int) -> list:
+    """Collect PV photos (raw bytes) from the OWNING worker."""
+    if is_local(worker):
+        import account_conn
+        import rubika_client as rb
+
+        async def _do(client):
+            out = []
+            guids = await rb.get_chat_list_guids(client, only_users=True)
+            for g in guids[:max_chats]:
+                async for _mid, fi in rb.iter_chat_photos(client, g):
+                    try:
+                        blob = await rb.download_photo(client, fi)
+                        if blob:
+                            out.append(blob)
+                    except Exception:
+                        continue
+                    if len(out) >= max_photos:
+                        return out
+            return out
+        return await account_conn.call(phone, _do, timeout=1800)
+    import base64
+    res = await api_call(worker, "POST", "/pvexport/run",
+                         {"phone": phone, "max_chats": max_chats,
+                          "max_photos": max_photos}, timeout=1900)
+    return [base64.b64decode(s) for s in res.get("photos_b64", [])]
+
+
+# --------------------------------------------------------------------------- #
 # Backup hook: pull each remote worker's session files into the zip.
 # Called by bot.build_backup_archive() via _add_worker_sessions().
 # --------------------------------------------------------------------------- #
