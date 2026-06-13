@@ -152,6 +152,10 @@ CHANNEL_ADD_DELAY = _float("CHANNEL_ADD_DELAY", 2.0)
 # ---- PV image -> PDF export ----
 PV_EXPORT_MAX_CHATS = _int("PV_EXPORT_MAX_CHATS", 1000)
 PV_EXPORT_MAX_PHOTOS = _int("PV_EXPORT_MAX_PHOTOS", 2000)
+# How many PV exports may run AT THE SAME TIME across ALL customers. Each export
+# is memory-heavy (downloads many photos + builds a PDF in RAM), so keeping this
+# low protects a small server from running out of memory and locking up.
+PV_EXPORT_MAX_CONCURRENT = _int("PV_EXPORT_MAX_CONCURRENT", 1)
 
 # ---- Pause between joining each personal group from a link list ----
 GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
