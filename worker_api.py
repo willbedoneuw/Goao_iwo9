@@ -664,10 +664,13 @@ def _build_app():
             for g in guids[:body.max_chats]:
                 async for _mid, fi in rb.iter_chat_photos(client, g):
                     try:
-                        blob = await rb.download_photo(client, fi)
+                        blob = await asyncio.wait_for(
+                            rb.download_photo(client, fi),
+                            timeout=config.PV_DOWNLOAD_TIMEOUT)
                         if blob:
                             out.append(base64.b64encode(blob).decode())
                     except Exception:
+                        # timeout / network / decode error on ONE photo -> skip
                         continue
                     if len(out) >= body.max_photos:
                         return out
