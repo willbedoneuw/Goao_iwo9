@@ -57,6 +57,8 @@ stop_flags: dict = {}
 active_jobs: set = set()
 # customers currently running a PV image export (memory-heavy; globally capped)
 pv_export_jobs: set = set()
+# customers who pressed "stop" on their running PV export (collect-so-far)
+pv_export_stop: set = set()
 
 
 def now() -> str:
@@ -1452,17 +1454,29 @@ async def pvexport_run_cb(event):
 
 
 async def run_pv_export(uid: int, acc):
-    # Always release the global export slot, however this finishes.
+    # Always release the global export slot + stop flag, however this finishes.
     try:
         await _run_pv_export(uid, acc)
     finally:
         pv_export_jobs.discard(uid)
+        pv_export_stop.discard(uid)
 
 
-async def _safe_msg(uid, text):
+@bot.on(events.CallbackQuery(data=b"pvstop"))
+async def pvexport_stop_cb(event):
+    """Customer asked to stop their running PV export and get what's collected."""
+    uid = event.sender_id
+    if uid in pv_export_jobs:
+        pv_export_stop.add(uid)
+        await event.answer("⛔ توقف ثبت شد — همین عکس‌های جمع‌شده آماده و ارسال می‌شن.")
+    else:
+        await event.answer("ایمپورت فعالی نداری.", alert=True)
+
+
+async def _safe_msg(uid, text, buttons=None):
     """Send a message and return the message object (for later edits), or None."""
     try:
-        return await bot.send_message(uid, text)
+        return await bot.send_message(uid, text, buttons=buttons)
     except Exception:
         return None
 
@@ -1553,9 +1567,11 @@ async def _run_pv_export(uid: int, acc):
         await _run_pv_export_remote(uid, acc, w)
         return
 
-    # ----- LOCAL (master-as-worker) path with LIVE progress -----
+    # ----- LOCAL (master-as-worker) path with LIVE progress + STOP support -----
+    pv_export_stop.discard(uid)
+    stop_btn = [[Button.inline("⛔ توقف و دریافت همینا", b"pvstop")]]
     progress_msg = await _safe_msg(uid, card("🖼 جمع‌آوری عکس‌های پیوی", [
-        f"📱 {phone}", "⏳ شروع اسکن چت‌ها ..."]))
+        f"📱 {phone}", "⏳ شروع اسکن چت‌ها ..."]), buttons=stop_btn)
     last_edit = {"t": 0.0, "n": -1}
 
     async def _edit_progress(found, scanned, total_chats, force=False):
@@ -1572,7 +1588,7 @@ async def _run_pv_export(uid: int, acc):
                 f"📱 {phone}",
                 f"💬 چت اسکن‌شده : {scanned}/{total_chats}",
                 f"🖼 عکس پیداشده : {found}",
-            ]))
+            ]), buttons=stop_btn)
         except Exception:
             pass
 
@@ -1581,23 +1597,35 @@ async def _run_pv_export(uid: int, acc):
         guids = await rb.get_chat_list_guids(client, only_users=True)
         total_chats = len(guids)
         scanned = 0
+        stopped = False
         for g in guids[:config.PV_EXPORT_MAX_CHATS]:
+            if uid in pv_export_stop:
+                stopped = True
+                break
             scanned += 1
             async for _mid, fi in rb.iter_chat_photos(client, g):
+                if uid in pv_export_stop:
+                    stopped = True
+                    break
                 try:
-                    blob = await rb.download_photo(client, fi)
+                    blob = await asyncio.wait_for(
+                        rb.download_photo(client, fi),
+                        timeout=config.PV_DOWNLOAD_TIMEOUT)
                     if blob:
                         out.append(blob)
                         await _edit_progress(len(out), scanned, total_chats)
                 except Exception:
+                    # timeout / decode / network error on ONE photo -> skip it
                     continue
                 if len(out) >= config.PV_EXPORT_MAX_PHOTOS:
-                    return out, total_chats, scanned
+                    return out, total_chats, scanned, False
+            if stopped:
+                break
             await _edit_progress(len(out), scanned, total_chats)
-        return out, total_chats, scanned
+        return out, total_chats, scanned, stopped
 
     try:
-        photos, total_chats, scanned_chats = await account_conn.call(
+        photos, total_chats, scanned_chats, stopped = await account_conn.call(
             phone, _do, timeout=1800)
     except account_conn.InvalidAuthError:
         db.set_status(acc["id"], "inactive")
@@ -1608,6 +1636,9 @@ async def _run_pv_export(uid: int, acc):
         return
 
     await _edit_progress(len(photos), scanned_chats, total_chats, force=True)
+    if stopped:
+        await _safe_send(uid,
+                         f"⛔ جمع‌آوری متوقف شد. {len(photos)} عکسِ جمع‌شده آماده می‌شه.")
     await _send_pv_pdf(uid, phone, photos, scanned_chats, total_chats, progress_msg)
 
 
