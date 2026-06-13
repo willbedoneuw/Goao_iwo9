@@ -135,6 +135,38 @@ def _line(c="─", n=60):
     print(c * n)
 
 
+def _marker_from_db(phone):
+    """Look up THIS account's customer marker from the local DB (read-only).
+    Returns the marker string or None. Safe if the DB isn't here (e.g. worker)."""
+    try:
+        import db
+        for a in db.list_accounts():
+            if rb.normalize_phone(a.get("phone", "")) == phone:
+                cid = a.get("customer_id")
+                if cid is not None:
+                    return (db.get_settings(int(cid)) or {}).get("marker")
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+async def _latest_saved_message(client):
+    """Fallback when no marker matches: grab a recent message id from the
+    account's OWN Saved Messages so the rate test can still run. Forwarding ANY
+    message to self exercises the same send/throttle path."""
+    saved_guid = await rb.get_self_guid(client)
+    try:
+        result = await client.get_messages(saved_guid, "0", "20")
+        messages = getattr(result, "messages", None)
+        if messages is None and isinstance(result, dict):
+            messages = result.get("messages", [])
+        if messages:
+            return saved_guid, rb._msg_id_of(messages[0])
+    except Exception:  # noqa: BLE001
+        pass
+    return saved_guid, None
+
+
 async def show_public_ip():
     """Best-effort public IP + geo. Needs outbound internet on this machine."""
     print("🌐 آی‌پی و موقعیت سرور (همون چیزی که روبیکا می‌بینه):")
@@ -241,7 +273,12 @@ async def main():
     target_mode = (_env("TEST_TARGET", "self") or "self").lower()
     count = int(_env("TEST_COUNT", "30"))
     delay = float(_env("TEST_DELAY", str(config.DEFAULT_DELAY)))
-    marker = _env("TEST_MARKER", config.FORWARD_MARKER)
+    # marker resolution: explicit TEST_MARKER > customer's marker in DB > default
+    marker_env = _env("TEST_MARKER")
+    db_marker = None if marker_env else _marker_from_db(phone)
+    marker = marker_env or db_marker or config.FORWARD_MARKER
+    marker_src = ("TEST_MARKER" if marker_env else
+                  ("دیتابیس" if db_marker else "پیش‌فرض"))
     # one command runs the FULL battery by default; set these to 0 to skip a part
     run_single = _env("TEST_SINGLE", "1") != "0"
     run_sweep = _env("TEST_SWEEP", "1") != "0"
@@ -252,8 +289,8 @@ async def main():
     print(f"🕒 {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"⚙️ MAX_ERRORS={config.MAX_ERRORS}  SEND_TIMEOUT={config.SEND_TIMEOUT}s  "
           f"RESUME_WAIT={config.RESUME_WAIT}s  RESUME_MAX_RETRIES={config.RESUME_MAX_RETRIES}")
-    print(f"⚙️ delay پیش‌فرض={config.DEFAULT_DELAY}s  marker=«{marker}»  "
-          f"target={target_mode}")
+    print(f"⚙️ delay پیش‌فرض={config.DEFAULT_DELAY}s  marker=«{marker}» "
+          f"(منبع: {marker_src})  target={target_mode}")
     _line("=")
 
     await show_public_ip()
@@ -263,14 +300,21 @@ async def main():
     try:
         client = await connect_account(phone)
 
-        # find the marked message in Saved Messages
+        # find the marked message in Saved Messages; if none, fall back to the
+        # latest Saved Messages message so the rate test can still run.
         print(f"🔎 جستجوی مارکر «{marker}» در Saved Messages ...")
         saved_guid, mid = await rb.find_marked_message(client, marker)
+        used = "پیامِ مارکر"
         if not mid:
-            print("   ❌ پیام مارکر پیدا نشد. مطمئن شو توی Saved Messages یه پیام با "
-                  "این مارکر در انتهای کپشن هست. (بدون مارکر تست ارسال ممکن نیست)")
+            print("   مارکر پیدا نشد؛ به «آخرین پیامِ Saved Messages» برمی‌گردم تا "
+                  "تستِ نرخِ ارسال بازم اجرا شه ...")
+            saved_guid, mid = await _latest_saved_message(client)
+            used = "آخرین پیامِ Saved Messages"
+        if not mid:
+            print("   ❌ هیچ پیامی توی Saved Messages این اکانت نیست. یه پیام (هرچی) "
+                  "توی Saved Messages بذار و دوباره اجرا کن.")
             return
-        print(f"   ✅ پیدا شد. saved_guid={saved_guid}  message_id={mid}")
+        print(f"   ✅ پیامِ تست انتخاب شد: message_id={mid}  (منبع: {used})")
 
         ordered = await show_recipient_stats(client)
 
