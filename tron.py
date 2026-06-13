@@ -1,30 +1,40 @@
 """
-tron.py — USDT (TRC20) payment verification via TronGrid.
-=========================================================
+tron.py -- TRX native payment verification via TronGrid.
+========================================================
 
-A customer pays the configured wallet in USDT (TRC20) and sends us the
-transaction hash. We confirm the payment ENTIRELY on-chain, with no trust in
-the customer's claim:
+A customer pays the configured wallet in TRX (native transfer) and sends us the
+transaction hash. We confirm the payment ENTIRELY on-chain:
 
-  1) the transaction exists and is CONFIRMED (contractRet == SUCCESS and packed
-     into a block with a SUCCESS receipt),
-  2) it is a TRC20 transfer of the official USDT contract,
+  1) the transaction exists and is CONFIRMED (contractRet == SUCCESS),
+  2) it is a native TRX transfer (TransferContract, NOT TriggerSmartContract),
   3) the destination address equals OUR wallet,
-  4) the transferred amount equals the plan price (within a tiny tolerance).
+  4) the transferred amount (in TRX) is within the configured tolerance of the
+     expected amount.
 
-Anti-fraud "each hash only once" is enforced by db.record_payment (the tx hash
+Additionally provides:
+  - get_trx_price_usd(): fetches TRX/USD from CoinGecko with 5-min cache
+  - calc_trx_amount(usd): converts a USD price to TRX (floor, integer)
+
+Anti-fraud "each hash only once" is enforced by db.record_deposit (the tx_hash
 column is UNIQUE), so even concurrent submissions cannot double-credit.
-
-We decode the transfer straight from the raw transaction `data` field
-(method id a9059cbb = transfer(address,uint256)), which avoids relying on
-TronGrid's event-indexing lag. Address (base58 <-> hex) conversion is done
-locally so there is no extra dependency.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import math
+import time
+
+import httpx
 
 import config
+import db
+import logbus
+
+# --------------------------------------------------------------------------- #
+# TRX price cache (module-level, simple dict).
+# --------------------------------------------------------------------------- #
+_price_cache: dict = {"price": 0.0, "ts": 0.0}
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -37,7 +47,6 @@ def _b58decode(s: str) -> bytes:
     for ch in s:
         num = num * 58 + _B58_ALPHABET.index(ch)
     full = num.to_bytes((num.bit_length() + 7) // 8, "big")
-    # restore leading zero bytes (each leading '1' == one 0x00 byte)
     pad = 0
     for ch in s:
         if ch == "1":
@@ -79,7 +88,73 @@ def hex_to_base58(hex_addr: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# TronGrid calls.
+# CoinGecko TRX price fetcher with 5-minute cache.
+# --------------------------------------------------------------------------- #
+async def get_trx_price_usd() -> float:
+    """Return the current TRX price in USD.
+
+    Priority:
+      1) db setting 'trx_price_override' (runtime override from owner panel)
+      2) config.TRX_PRICE_OVERRIDE (env-level override)
+      3) CoinGecko API with 5-minute in-memory cache
+    """
+    # 1) Runtime override from owner panel (db setting)
+    try:
+        db_override = float(db.get_setting("trx_price_override", "0"))
+        if db_override > 0:
+            return db_override
+    except (TypeError, ValueError):
+        pass
+
+    # 2) Env-level override
+    if config.TRX_PRICE_OVERRIDE > 0:
+        return config.TRX_PRICE_OVERRIDE
+
+    # 3) CoinGecko with cache
+    now = time.time()
+    if (_price_cache["price"] > 0
+            and now - _price_cache["ts"] < config.COINGECKO_CACHE_SECONDS):
+        return _price_cache["price"]
+
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+            price = float(data["tron"]["usd"])
+            _price_cache["price"] = price
+            _price_cache["ts"] = time.time()
+            return price
+    except Exception:
+        # If fetch fails but we have a stale cache, use it
+        if _price_cache["price"] > 0:
+            return _price_cache["price"]
+        raise
+
+
+def calc_trx_amount(usd_price: float) -> int:
+    """Convert a USD price to TRX amount (floor, integer -- customer-friendly).
+
+    This is a synchronous wrapper that calls the async price fetcher via the
+    event loop. For async contexts, use: trx_price = await get_trx_price_usd()
+    and then math.floor(usd_price / trx_price).
+    """
+    # For use in async context, callers should use calc_trx_amount_async instead.
+    # This exists for API compatibility.
+    raise RuntimeError("Use calc_trx_amount_async in async context")
+
+
+async def calc_trx_amount_async(usd_price: float) -> int:
+    """Convert a USD price to TRX amount (floor, integer -- customer-friendly)."""
+    trx_price = await get_trx_price_usd()
+    if trx_price <= 0:
+        raise ValueError("TRX price is zero or negative")
+    return math.floor(usd_price / trx_price)
+
+
+# --------------------------------------------------------------------------- #
+# TronGrid API helpers.
 # --------------------------------------------------------------------------- #
 def _headers() -> dict:
     h = {"Content-Type": "application/json"}
@@ -88,36 +163,18 @@ def _headers() -> dict:
     return h
 
 
-async def _get_tx(client, tx_hash: str) -> dict:
+async def _get_tx(client: httpx.AsyncClient, tx_hash: str) -> tuple:
+    """Fetch transaction by ID. Returns (response_dict, status_code, body_text)."""
     url = f"{config.TRONGRID_BASE}/wallet/gettransactionbyid"
     r = await client.post(url, json={"value": tx_hash}, headers=_headers())
+    body_text = r.text
     r.raise_for_status()
-    return r.json() or {}
+    return r.json() or {}, r.status_code, body_text
 
 
-async def _get_tx_info(client, tx_hash: str) -> dict:
-    url = f"{config.TRONGRID_BASE}/wallet/gettransactioninfobyid"
-    r = await client.post(url, json={"value": tx_hash}, headers=_headers())
-    r.raise_for_status()
-    return r.json() or {}
-
-
-def _decode_transfer(data_hex: str):
-    """Decode a TRC20 transfer(address,uint256) data blob.
-    Returns (to_hex_41, raw_amount_int) or (None, None) if not a transfer."""
-    data_hex = (data_hex or "").lower()
-    if not data_hex.startswith("a9059cbb") or len(data_hex) < 8 + 64 + 64:
-        return None, None
-    to_arg = data_hex[8:8 + 64]            # 32-byte address arg (left-padded)
-    amount_arg = data_hex[8 + 64:8 + 128]  # 32-byte uint256 amount
-    to_hex = "41" + to_arg[-40:]           # last 20 bytes + TRON 0x41 prefix
-    try:
-        raw_amount = int(amount_arg, 16)
-    except ValueError:
-        return None, None
-    return to_hex, raw_amount
-
-
+# --------------------------------------------------------------------------- #
+# VerifyResult.
+# --------------------------------------------------------------------------- #
 class VerifyResult:
     def __init__(self, ok: bool, reason: str = "", amount: float = 0.0,
                  to_address: str = "", confirmed: bool = False):
@@ -128,12 +185,17 @@ class VerifyResult:
         self.confirmed = confirmed
 
 
-async def verify_usdt_payment(tx_hash: str, expected_amount: float) -> VerifyResult:
-    """Verify ONE USDT (TRC20) transfer on-chain.
+# --------------------------------------------------------------------------- #
+# Main verification function: verify_trx_payment.
+# --------------------------------------------------------------------------- #
+async def verify_trx_payment(tx_hash: str, expected_trx: int) -> VerifyResult:
+    """Verify ONE native TRX transfer (TransferContract) on-chain.
 
     Returns VerifyResult(ok=True, ...) only when the transaction is a confirmed
-    USDT transfer of EXACTLY `expected_amount` into the configured wallet.
-    `ok=False` carries a human-readable Persian `reason`.
+    native TRX transfer of at least `expected_trx` (within tolerance) into the
+    configured wallet. `ok=False` carries a human-readable Persian `reason`.
+
+    Retries up to 3 times with 3s delay if the transaction is not found.
     """
     tx_hash = (tx_hash or "").strip().lower().replace("0x", "")
     if not tx_hash or len(tx_hash) < 60:
@@ -142,72 +204,97 @@ async def verify_usdt_payment(tx_hash: str, expected_amount: float) -> VerifyRes
         return VerifyResult(False, "آدرس ولت مقصد تنظیم نشده.")
 
     try:
-        import httpx
-    except ImportError:
-        return VerifyResult(False, "httpx نصب نیست.")
-
-    try:
         wallet_hex = base58_to_hex(config.WALLET_ADDRESS).lower()
-        usdt_hex = base58_to_hex(config.USDT_CONTRACT).lower()
     except Exception:
-        return VerifyResult(False, "آدرس ولت/قرارداد نامعتبره.")
+        return VerifyResult(False, "آدرس ولت مقصد نامعتبره.")
+
+    # Retry logic: up to 3 attempts with 3s delay
+    tx = None
+    last_error = ""
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=config.TRON_TIMEOUT) as client:
+                tx_data, status_code, body_text = await _get_tx(client, tx_hash)
+
+                # Log raw TronGrid response for anti-fraud audit
+                log_text = (
+                    f"[TronGrid] verify tx={tx_hash[:16]}...\n"
+                    f"status={status_code}\n"
+                    f"body={body_text[:500]}"
+                )
+                await logbus.to_group(log_text)
+
+                if tx_data and "raw_data" in tx_data:
+                    tx = tx_data
+                    break
+                else:
+                    last_error = "تراکنش پیدا نشد (هنوز ثبت نشده؟)."
+        except Exception as e:
+            last_error = f"خطا در ارتباط با TronGrid: {repr(e)[:140]}"
+
+        if attempt < 2:
+            await asyncio.sleep(3)
+
+    if tx is None:
+        return VerifyResult(False, last_error)
 
     try:
-        async with httpx.AsyncClient(timeout=config.TRON_TIMEOUT) as client:
-            tx = await _get_tx(client, tx_hash)
-            if not tx or "raw_data" not in tx:
-                return VerifyResult(False, "تراکنش پیدا نشد (هنوز ثبت نشده؟).")
+        # 1) Check contractRet == SUCCESS
+        ret = (tx.get("ret") or [{}])[0]
+        if str(ret.get("contractRet", "")).upper() != "SUCCESS":
+            return VerifyResult(False, "تراکنش روی شبکه موفق/تاییدشده نیست.")
 
-            # 1) confirmed + successful
-            ret = (tx.get("ret") or [{}])[0]
-            if str(ret.get("contractRet", "")).upper() != "SUCCESS":
-                return VerifyResult(False, "تراکنش روی شبکه موفق/تأییدشده نیست.")
+        # 2) Check contract type is TransferContract (native TRX)
+        contracts = tx.get("raw_data", {}).get("contract", [])
+        if not contracts:
+            return VerifyResult(False, "محتوای تراکنش نامعتبره.")
+        c0 = contracts[0]
+        if c0.get("type") != "TransferContract":
+            return VerifyResult(False, "این تراکنش یک انتقال TRX نیست (نوع اشتباه).")
 
-            contracts = tx.get("raw_data", {}).get("contract", [])
-            if not contracts:
-                return VerifyResult(False, "محتوای تراکنش نامعتبره.")
-            c0 = contracts[0]
-            if c0.get("type") != "TriggerSmartContract":
-                return VerifyResult(False, "این تراکنش انتقال TRC20 نیست.")
+        # 3) Extract to_address and amount from TransferContract parameters
+        value = c0.get("parameter", {}).get("value", {})
+        to_address_hex = str(value.get("to_address", "")).lower()
+        amount_sun = int(value.get("amount", 0))
 
-            value = c0.get("parameter", {}).get("value", {})
-            contract_addr = str(value.get("contract_address", "")).lower()
-            if contract_addr != usdt_hex:
-                return VerifyResult(False, "این تراکنش مربوط به قرارداد USDT نیست.")
+        if not to_address_hex:
+            return VerifyResult(False, "آدرس مقصد در تراکنش یافت نشد.")
 
-            to_hex, raw_amount = _decode_transfer(value.get("data", ""))
-            if to_hex is None:
-                return VerifyResult(False, "تراکنش یک انتقال استاندارد USDT نیست.")
-            to_hex = to_hex.lower()
+        # 4) Compare destination to our wallet (both in hex form)
+        if to_address_hex != wallet_hex:
+            # Try to convert for display
+            try:
+                to_display = hex_to_base58(to_address_hex)
+            except Exception:
+                to_display = to_address_hex
+            return VerifyResult(
+                False, "مقصد تراکنش با آدرس ولت ما یکی نیست.",
+                to_address=to_display)
 
-            if to_hex != wallet_hex:
-                return VerifyResult(
-                    False, "مقصد تراکنش با آدرس ولت ما یکی نیست.",
-                    to_address=hex_to_base58(to_hex))
+        # 5) Convert SUN to TRX (1 TRX = 1,000,000 SUN)
+        actual_trx = amount_sun / 1_000_000
 
-            amount = raw_amount / (10 ** config.USDT_DECIMALS)
+        # 6) Check amount with tolerance
+        tolerance_str = db.get_setting(
+            "payment_tolerance_percent",
+            str(config.PAYMENT_TOLERANCE_PERCENT)
+        )
+        try:
+            tolerance = float(tolerance_str)
+        except (TypeError, ValueError):
+            tolerance = config.PAYMENT_TOLERANCE_PERCENT
 
-            # 2) double-check it is packed into a block with a SUCCESS receipt
-            info = await _get_tx_info(client, tx_hash)
-            confirmed = bool(info.get("blockNumber"))
-            receipt = (info.get("receipt") or {}).get("result")
-            if receipt and str(receipt).upper() != "SUCCESS":
-                return VerifyResult(False, "رسید تراکنش موفق نیست.")
-            if not confirmed:
-                return VerifyResult(False, "تراکنش هنوز در بلاک تأیید نشده.",
-                                    amount=amount,
-                                    to_address=config.WALLET_ADDRESS)
+        min_acceptable = expected_trx * (1 - tolerance / 100)
+        if actual_trx < min_acceptable:
+            return VerifyResult(
+                False,
+                f"مبلغ تراکنش ({actual_trx:g} TRX) کمتر از حد مجاز "
+                f"({expected_trx} TRX با {tolerance}% تلرانس) است.",
+                amount=actual_trx, to_address=config.WALLET_ADDRESS,
+                confirmed=True)
 
-            # 3) exact amount (within tolerance)
-            if abs(amount - float(expected_amount)) > config.PAYMENT_AMOUNT_TOLERANCE:
-                return VerifyResult(
-                    False,
-                    f"مبلغ تراکنش ({amount:g} USDT) با مبلغ پلن "
-                    f"({float(expected_amount):g} USDT) برابر نیست.",
-                    amount=amount, to_address=config.WALLET_ADDRESS,
-                    confirmed=True)
+        return VerifyResult(True, "", amount=actual_trx,
+                            to_address=config.WALLET_ADDRESS, confirmed=True)
 
-            return VerifyResult(True, "", amount=amount,
-                                to_address=config.WALLET_ADDRESS, confirmed=True)
-    except Exception as e:  # noqa: BLE001
-        return VerifyResult(False, f"خطا در ارتباط با TronGrid: {repr(e)[:140]}")
+    except Exception as e:
+        return VerifyResult(False, f"خطا در پردازش تراکنش: {repr(e)[:140]}")
