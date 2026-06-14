@@ -1054,11 +1054,22 @@ async def _rubika_post_add(uid, aid, phone, w):
             f"🆔 {uid}", f"📱 {phone}", f"✅ {sent}", f"📌 {marker}",
             f"🕒 {now()}"])
     elif err == "marker_not_found":
-        text = card("🧪 تست انجام نشد", [
+        text = card("🧪 تست انجام نشد — مارکر پیدا نشد", [
             f"📱 {phone}",
-            "پیامِ مارکر پیدا نشد.",
-            "بعد از تنظیمِ «📌 مارکر» و گذاشتنِ پیامِ مارکر تو Saved Messages، "
-            "ارسال تست واقعی می‌شه."])
+            "پیامِ مارکر توی Saved Messages این اکانت نیست.",
+            LINE,
+            "برای اینکه ارسال کار کنه:",
+            "۱) توی Saved Messages همین اکانت یه پیام بذار (متن یا عکس).",
+            f"۲) آخرِ متن/کپشنش دقیقاً بنویس:  {marker}",
+            "۳) بعد دوباره «🚀 ارسال» رو بزن.",
+        ])
+        buttons = [[Button.inline("📌 تنظیم/تغییر مارکر", b"marker")],
+                   [Button.inline("📖 راهنمای مارکر", b"help_marker")]]
+        await logbus.event("🧪 RB SEND PROBE SKIPPED", [
+            f"🆔 {uid}", f"📱 {phone}",
+            f"📌 مارکرِ «{marker}» توی Saved Messages نبود",
+            "→ مشتری باید پیامِ مارکر بذاره و دوباره ارسال بزنه",
+            f"🕒 {now()}"], pv_user=uid)
     else:
         reason = (f"🚫 {too} بار TOO_REQUESTS" if too
                   else f"💥 {err or 'ارسال ناموفق'}")
