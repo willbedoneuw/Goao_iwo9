@@ -1275,6 +1275,7 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                         timeout=body.send_timeout,
                     )
                     job["ok"] += 1
+                    attempt_fail = 0   # count CONSECUTIVE errors only
                 except Exception as e:  # noqa: BLE001
                     job["fail"] += 1
                     attempt_fail += 1
