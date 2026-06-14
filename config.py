@@ -134,15 +134,17 @@ DEFAULT_DELAY = _float("SEND_DELAY", 1.0)
 # Marker at the end of the caption of the message in the account's Saved Messages.
 FORWARD_MARKER = os.getenv("FORWARD_MARKER", "کد135").strip()
 
-# Stop the whole run after this many failed sends.
-MAX_ERRORS = _int("MAX_ERRORS", 3)
+# Pause a send after this many CONSECUTIVE failed sends (a healthy send with
+# scattered failures keeps going; only a real block trips it).
+MAX_ERRORS = _int("MAX_ERRORS", 10)
 
 # Per-send timeout so a single stuck send can never hang the whole run.
 SEND_TIMEOUT = _int("SEND_TIMEOUT", 60)
 
-# Auto-resume (continue a send after an error): wait then resume.
+# Auto-resume: on hitting MAX_ERRORS consecutive errors, wait RESUME_WAIT (5 min)
+# then resume; if it trips again, stop for good (RESUME_MAX_RETRIES resume(s)).
 RESUME_WAIT = _int("RESUME_WAIT", 300)
-RESUME_MAX_RETRIES = _int("RESUME_MAX_RETRIES", 2)
+RESUME_MAX_RETRIES = _int("RESUME_MAX_RETRIES", 1)
 
 # ---- Channel send mode (kept for the reused worker_api endpoints) ----
 CHANNEL_MEMBER_TARGET = _int("CHANNEL_MEMBER_TARGET", 300)

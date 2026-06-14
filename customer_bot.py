@@ -1637,6 +1637,8 @@ async def _run_send_remote(payload: dict):
     ok = 0
     fail = 0
     prog_logged = 0
+    fail_logged = 0
+    last_state = "sending"
     stop_flags.pop(account_id, None)
     active_jobs.add(account_id)
 
@@ -1691,6 +1693,33 @@ async def _run_send_remote(payload: dict):
                     continue
                 ok = stt.get("ok", ok)
                 fail = stt.get("fail", fail)
+                # per-error -> ONLY the central log group (which account + customer)
+                wtag = w.get("tag") or w.get("id")
+                while fail_logged < fail:
+                    fail_logged += 1
+                    try:
+                        await logbus.to_group(card("❌ SEND ERROR", [
+                            f"📱 اکانت : {phone}",
+                            f"🆔 مشتری : {uid}",
+                            f"🖥 ورکر : {wtag}",
+                            f"🕒 {now()}"]))
+                    except Exception:
+                        pass
+                # pause / resume -> log to BOTH the owner group and the customer PV
+                cur_state = stt.get("state")
+                if cur_state == "waiting" and last_state != "waiting":
+                    await logbus.event("⏸ ارسال موقتاً متوقف شد", [
+                        f"🆔 {uid}", f"📱 {phone}",
+                        f"⚠️ {config.MAX_ERRORS} خطای پشت‌سرهم",
+                        f"⏳ {config.RESUME_WAIT // 60} دقیقه صبر، بعد خودکار ادامه می‌ده",
+                        f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
+                        f"🕒 {now()}"], pv_user=uid)
+                elif cur_state == "sending" and last_state == "waiting":
+                    await logbus.event("▶️ ارسال ادامه یافت", [
+                        f"🆔 {uid}", f"📱 {phone}",
+                        f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
+                        f"🕒 {now()}"], pv_user=uid)
+                last_state = cur_state
                 # live progress to the central log group (throttled)
                 if config.SEND_PROGRESS_STEP and ok - prog_logged >= config.SEND_PROGRESS_STEP:
                     prog_logged = ok
@@ -1698,7 +1727,7 @@ async def _run_send_remote(payload: dict):
                         await logbus.to_group(card("🔄 SEND PROGRESS", [
                             f"📱 {phone}",
                             f"✅ {ok}   ❌ {fail}   📁 {total}",
-                            f"🖥 {w.get('tag') or w.get('id')}",
+                            f"🖥 {wtag}",
                             f"🕒 {now()}"]))
                     except Exception:
                         pass
