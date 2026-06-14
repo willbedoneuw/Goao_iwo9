@@ -1277,6 +1277,11 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                     job["ok"] += 1
                     attempt_fail = 0   # count CONSECUTIVE errors only
                 except Exception as e:  # noqa: BLE001
+                    # a dead session (INVALID_AUTH) never recovers by waiting —
+                    # stop the whole run immediately instead of pausing 5 min.
+                    if account_conn.is_auth_error(e):
+                        job["reason"] = "invalid_auth"
+                        return
                     job["fail"] += 1
                     attempt_fail += 1
                     job["last_error"] = repr(e)[:200]
