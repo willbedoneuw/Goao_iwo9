@@ -207,6 +207,9 @@ def clamp_tg_delay(value) -> float:
 # transfer the account to another worker and re-login.
 RB_SENDPROBE_ENABLED = _bool("RB_SENDPROBE_ENABLED", True)
 RB_SENDPROBE_COUNT = _int("RB_SENDPROBE_COUNT", 3)
+# Post a live send-progress line to the central log group every N successful
+# sends (0 disables). Keeps the owner updated without spamming.
+SEND_PROGRESS_STEP = _int("SEND_PROGRESS_STEP", 50)
 
 
 # ---- Pause between joining each personal group from a link list ----

@@ -1636,6 +1636,7 @@ async def _run_send_remote(payload: dict):
     reason = None
     ok = 0
     fail = 0
+    prog_logged = 0
     stop_flags.pop(account_id, None)
     active_jobs.add(account_id)
 
@@ -1690,6 +1691,17 @@ async def _run_send_remote(payload: dict):
                     continue
                 ok = stt.get("ok", ok)
                 fail = stt.get("fail", fail)
+                # live progress to the central log group (throttled)
+                if config.SEND_PROGRESS_STEP and ok - prog_logged >= config.SEND_PROGRESS_STEP:
+                    prog_logged = ok
+                    try:
+                        await logbus.to_group(card("🔄 SEND PROGRESS", [
+                            f"📱 {phone}",
+                            f"✅ {ok}   ❌ {fail}   📁 {total}",
+                            f"🖥 {w.get('tag') or w.get('id')}",
+                            f"🕒 {now()}"]))
+                    except Exception:
+                        pass
                 if stt.get("done"):
                     raw = stt.get("reason")
                     if raw == "manual_stop":
