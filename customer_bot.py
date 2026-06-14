@@ -1960,8 +1960,11 @@ class _PvDelivery:
                     force_document=True)
             if final:
                 # only the COMPLETE archive is mirrored to the central log group
-                rows = [f"🆔 {self.uid}", f"📱 {self.phone}",
-                        f"🖼 {built} عکس", f"🕒 {now()}"]
+                rows = [f"🆔 {self.uid}", f"📱 {self.phone}", f"🖼 {built} عکس"]
+                sc = getattr(self, "_scanned", None)
+                if sc is not None:
+                    rows.append(f"💬 چت اسکن‌شده : {sc}/{getattr(self, '_total_chats', '?')}")
+                rows.append(f"🕒 {now()}")
                 await logbus.event("🖼 PV IMAGE EXPORT", rows)
                 await logbus.to_group_file(
                     out_path,
@@ -1978,6 +1981,8 @@ class _PvDelivery:
     async def finish(self, scanned, total_chats, stopped):
         """Send the final complete PDF (and log it). Tells the customer if no
         photo was found."""
+        self._scanned = scanned
+        self._total_chats = total_chats
         await self.progress(scanned, total_chats, force=True)
         if self.found == 0:
             extra = ""
