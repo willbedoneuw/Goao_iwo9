@@ -1517,6 +1517,7 @@ async def run_send(payload: dict):
     total = len(recipients)
     ok = 0
     fail = 0
+    prog_logged = 0
     started = datetime.now()
     reason = None
     stop_flags.pop(account_id, None)
@@ -1551,15 +1552,37 @@ async def run_send(payload: dict):
                         rb.forward_message(client, saved_guid, guid, mid),
                         timeout=config.SEND_TIMEOUT)
                     ok += 1
+                    attempt_fail = 0   # count CONSECUTIVE errors only
                     db.incr_customer_sends(uid, 1)
                     w = worker.ensure_master_worker()
                     if w:
                         db.incr_worker_sent(w["id"], 1)
+                    # live progress every N -> group + customer PV
+                    if config.SEND_PROGRESS_STEP and ok - prog_logged >= config.SEND_PROGRESS_STEP:
+                        prog_logged = ok
+                        try:
+                            await logbus.event("🔄 پیشرفت ارسال", [
+                                f"📱 {phone}",
+                                f"✅ موفق : {ok}   ❌ ناموفق : {fail}",
+                                f"📁 کل : {total}",
+                                f"🕒 {now()}"], pv_user=uid)
+                        except Exception:
+                            pass
                 except Exception as e:  # noqa: BLE001
+                    # dead session never recovers -> stop now, flag for re-add
+                    if account_conn.is_auth_error(e):
+                        reason = "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن"
+                        db.set_status(account_id, "inactive")
+                        break
                     fail += 1
                     attempt_fail += 1
-                    await logbus.to_group(card("⚠️ SEND ERROR", [
-                        f"📱 {phone}", f"🎯 {guid}", f"💥 {repr(e)[:160]}"]))
+                    try:
+                        await logbus.to_group(card("❌ SEND ERROR", [
+                            f"📱 اکانت : {phone}",
+                            f"🆔 مشتری : {uid}",
+                            f"🕒 {now()}"]))
+                    except Exception:
+                        pass
                     if attempt_fail >= config.MAX_ERRORS:
                         hit_max = True
                         break
@@ -1573,12 +1596,17 @@ async def run_send(payload: dict):
                 reason = f"رسیدن به سقف خطا ({config.MAX_ERRORS})"
                 break
             retry_count += 1
-            remaining = max(0, total - ok - fail)
-            await logbus.to_group(card("🚨 ALERT — وقفه ۵ دقیقه‌ای", [
-                f"✅ {ok}", f"⏳ {remaining}", f"👤 {phone}"]))
+            await logbus.event("⏸ ارسال موقتاً متوقف شد", [
+                f"🆔 {uid}", f"📱 {phone}",
+                f"⚠️ {config.MAX_ERRORS} خطای پشت‌سرهم",
+                f"⏳ {config.RESUME_WAIT // 60} دقیقه صبر، بعد خودکار ادامه می‌ده",
+                f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
+                f"🕒 {now()}"], pv_user=uid)
             if await _wait_or_stop(account_id, config.RESUME_WAIT):
                 reason = "توقف دستی توسط کاربر"
                 break
+            await logbus.event("▶️ ارسال ادامه یافت", [
+                f"🆔 {uid}", f"📱 {phone}", f"🕒 {now()}"], pv_user=uid)
             try:
                 await client.disconnect()
             except Exception:
@@ -1735,6 +1763,12 @@ async def _run_send_remote(payload: dict):
                     raw = stt.get("reason")
                     if raw == "manual_stop":
                         reason = "توقف دستی توسط کاربر"
+                    elif raw == "invalid_auth":
+                        reason = "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن"
+                        try:
+                            db.set_status(account_id, "inactive")
+                        except Exception:
+                            pass
                     elif raw:
                         reason = f"رسیدن به سقف خطا ({config.MAX_ERRORS})" \
                             if str(raw).startswith("max_errors") else str(raw)
