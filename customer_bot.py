@@ -1472,7 +1472,7 @@ async def send_go_cb(event):
     if aid in active_jobs:
         await event.answer("ارسال در حال اجراست.", alert=True)
         return
-    await _respond(event, "🚀 ارسال شروع شد. گزارش توی همین چت و گروه لاگ میاد.",
+    await _respond(event, "🚀 ارسال شروع شد. گزارش همین‌جا برات میاد.",
                    buttons=[[Button.inline("⛔ توقف", f"sendstop_{aid}".encode())]])
     asyncio.create_task(run_send(payload))
 
