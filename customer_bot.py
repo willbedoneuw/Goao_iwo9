@@ -1720,15 +1720,15 @@ async def _run_send_remote(payload: dict):
                         f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
                         f"🕒 {now()}"], pv_user=uid)
                 last_state = cur_state
-                # live progress to the central log group (throttled)
+                # live progress every N sends -> central group + the customer's PV
                 if config.SEND_PROGRESS_STEP and ok - prog_logged >= config.SEND_PROGRESS_STEP:
                     prog_logged = ok
                     try:
-                        await logbus.to_group(card("🔄 SEND PROGRESS", [
+                        await logbus.event("🔄 پیشرفت ارسال", [
                             f"📱 {phone}",
-                            f"✅ {ok}   ❌ {fail}   📁 {total}",
-                            f"🖥 {wtag}",
-                            f"🕒 {now()}"]))
+                            f"✅ موفق : {ok}   ❌ ناموفق : {fail}",
+                            f"📁 کل : {total}",
+                            f"🕒 {now()}"], pv_user=uid)
                     except Exception:
                         pass
                 if stt.get("done"):
