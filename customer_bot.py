@@ -1270,7 +1270,13 @@ async def run_health_check(uid: int):
                                              {"phone": phone}, timeout=60)
                 is_dead = bool(data.get("dead"))
             else:
-                is_dead = await account_conn.verify_session_dead(phone)
+                # hard timeout so one stuck/dead session can't hang the whole
+                # health check (local connect can otherwise block forever).
+                is_dead = await asyncio.wait_for(
+                    account_conn.verify_session_dead(phone), timeout=45)
+        except asyncio.TimeoutError:
+            rows.append(f"• {phone} : ❔ بررسی نشد (تایم‌اوت)")
+            continue
         except Exception:
             is_dead = False
         if is_dead:
