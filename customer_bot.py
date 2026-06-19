@@ -36,6 +36,7 @@ import pdf_export
 import ratelimit
 import rubika_client as rb
 import tg_panel
+import bale_panel
 import tron
 import worker
 
@@ -94,10 +95,11 @@ def _sub_line(uid: int) -> str:
 
 
 def root_menu():
-    """The two-door root: choose the Telegram or the Rubika section."""
+    """Root: Rubika + Telegram side by side, with a big Bale button below."""
     return [
-        [Button.inline("📨 تلگرام", b"tg_home")],
-        [Button.inline("🟣 روبیکا", b"rubika_open")],
+        [Button.inline("🟣 روبیکا", b"rubika_open"),
+         Button.inline("📨 تلگرام", b"tg_home")],
+        [Button.inline("🔵 بـلـه", b"bale_home")],
     ]
 
 
@@ -2266,6 +2268,7 @@ async def amain():
     await bot.start(bot_token=config.CUSTOMER_BOT_TOKEN)
     logbus.bind(bot)
     tg_panel.setup(bot, state)   # register the decoupled Telegram section
+    bale_panel.setup(bot, state, tg_panel._state)   # decoupled Bale section
     await logbus.to_group(card("🤖 CUSTOMER BOT ONLINE", [
         f"🏷 Version : {config.VERSION}", f"🕒 {now()}"]))
     asyncio.create_task(expiry_loop())
