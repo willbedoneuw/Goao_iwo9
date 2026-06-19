@@ -74,6 +74,13 @@ def dump(obj) -> str:
     return str(fields) if fields else repr(obj)
 
 
+async def ainput(prompt: str) -> str:
+    """Non-blocking input(): runs the blocking read in a thread so the asyncio
+    event loop (and aiobale's keep-alive ping) keeps running while we wait —
+    otherwise a long pause at a prompt kills the WebSocket connection."""
+    return (await asyncio.to_thread(input, prompt)).strip()
+
+
 # --------------------------------------------------------------------------- #
 # Import aiobale (clear message if missing).
 # --------------------------------------------------------------------------- #
@@ -131,7 +138,7 @@ async def do_login(client: "Client", phone_int: int) -> bool:
     tx = getattr(resp, "transaction_hash", None)
     log("✅ LOGIN", f"کد ارسال شد. transaction_hash={tx}  | full={dump(resp)}")
 
-    code = input("کدی که بله فرستاد رو وارد کن: ").strip()
+    code = await ainput("کدی که بله فرستاد رو وارد کن: ")
     log("🔐 LOGIN", "validate_code(...) ...")
     try:
         res = await client.validate_code(code, tx)
@@ -142,7 +149,7 @@ async def do_login(client: "Client", phone_int: int) -> bool:
     if isinstance(res, AuthErrors):
         if res == AuthErrors.PASSWORD_NEEDED:
             log("🔐 LOGIN", "این اکانت رمز دومرحله‌ای داره.")
-            pwd = input("رمز دومرحله‌ای رو وارد کن: ").strip()
+            pwd = await ainput("رمز دومرحله‌ای رو وارد کن: ")
             try:
                 res = await client.validate_password(pwd, tx)
             except Exception as e:  # noqa: BLE001
@@ -236,9 +243,12 @@ def _extract_dialog_peers(raw: dict):
         peer = _g(d, "1", 1) or {}
         ptype = _g(peer, "1", 1)
         pid = _g(peer, "2", 2)
+        sub = _g(_g(d, "13", 13) or {}, "1", 1)   # subtype: 1=user, 2=group, 4=bot
         if pid is None:
             continue
-        out.append({"id": int(pid), "type": int(ptype) if ptype is not None else 0})
+        out.append({"id": int(pid),
+                    "type": int(ptype) if ptype is not None else 0,
+                    "ctype": int(sub) if sub is not None else 0})
     return out
 
 
@@ -311,20 +321,23 @@ async def send_tests(client: "Client", pv, groups):
         except Exception as e:  # noqa: BLE001
             logx("❌ SEND-SELF", e)
 
-    # 5b) optional: send to the FIRST private chat (with confirmation)
-    ans = input("یه پیامِ تست به اولین پیوی بفرستم؟ (y/N): ").strip().lower()
-    if ans == "y" and pv:
-        p = pv[0]
+    # 5b) optional: send to the FIRST REAL private chat (not me, not a bot)
+    ans = (await ainput("یه پیامِ تست به اولین پیویِ واقعی بفرستم؟ (y/N): ")).lower()
+    real_pv = [p for p in pv if p["id"] != me_id and p.get("ctype") != 4]
+    if ans == "y" and real_pv:
+        p = real_pv[0]
         try:
             msg = await client.send_message(
                 text="🧪 تست ارسال (نادیده بگیر)",
                 chat_id=int(p["id"]), chat_type=ChatType.PRIVATE)
-            log("✅ SEND-PV", f"به اولین پیوی (id={p['id']}) ارسال شد. {dump(msg)}")
+            log("✅ SEND-PV", f"به پیویِ واقعی (id={p['id']}) ارسال شد. {dump(msg)}")
         except Exception as e:  # noqa: BLE001
             logx("❌ SEND-PV", e)
+    elif ans == "y":
+        log("⏭ SEND-PV", "پیویِ واقعی (غیرخودت/غیربات) پیدا نشد")
 
     # 5c) optional: send to the FIRST group (with confirmation)
-    ans = input("یه پیامِ تست به اولین گروه بفرستم؟ (y/N): ").strip().lower()
+    ans = (await ainput("یه پیامِ تست به اولین گروه بفرستم؟ (y/N): ")).lower()
     if ans == "y" and groups:
         p = groups[0]
         try:
@@ -340,7 +353,7 @@ async def send_tests(client: "Client", pv, groups):
 # 6) Rate-limit probe (به خودت، امن): چند ارسالِ پیاپی تا ببینیم بله کِی محدود می‌کنه
 # --------------------------------------------------------------------------- #
 async def rate_probe(client: "Client"):
-    ans = input("تستِ محدودیت: ۳۰ پیامِ پیاپی به خودت بفرستم؟ (y/N): ").strip().lower()
+    ans = (await ainput("تستِ محدودیت: ۳۰ پیامِ پیاپی به خودت بفرستم؟ (y/N): ")).lower()
     if ans != "y":
         log("⏭ RATE", "رد شد")
         return
@@ -368,7 +381,7 @@ async def rate_probe(client: "Client"):
 # --------------------------------------------------------------------------- #
 async def main():
     log("=" * 8, "BALE PROBE START " + "=" * 8)
-    raw = input("شماره‌ی اکانت بله (فقط رقم، با کد کشور؛ مثل 989121234567): ").strip()
+    raw = await ainput("شماره‌ی اکانت بله (فقط رقم، با کد کشور؛ مثل 989121234567): ")
     digits = "".join(ch for ch in raw if ch.isdigit())
     if not digits:
         log("❌ INPUT", "شماره نامعتبر")
