@@ -86,6 +86,15 @@ except Exception as e:  # noqa: BLE001
     log("ℹ️ HINT", "اول نصبش کن:  ./venv/bin/pip install aiobale")
     sys.exit(1)
 
+# Low-level method classes (used for RAW requests that skip aiobale's pydantic
+# models — those crash on bot dialogs with keyboards).
+try:
+    from aiobale.methods import LoadDialogs, GetContacts
+    log("✅ IMPORT", "method classes (LoadDialogs/GetContacts) OK")
+except Exception as e:  # noqa: BLE001
+    LoadDialogs = GetContacts = None
+    log("⚠️ IMPORT", f"method classes وارد نشدن: {e!r}")
+
 
 def _peer_kind(peer) -> str:
     """Map a dialog peer type to a human label (PV vs GROUP)."""
@@ -187,41 +196,102 @@ async def call_probe(client: "Client", name: str, coro_factory):
 
 
 # --------------------------------------------------------------------------- #
-# 3+4) READ contacts + dialogs (PV vs GROUP, جدا جدا)
+# RAW request: send a method and return the decoded dict WITHOUT aiobale's
+# pydantic model (which crashes on bot dialogs). Lets us read peers safely.
+# --------------------------------------------------------------------------- #
+async def _raw_request(client: "Client", method, timeout: int = 25):
+    await _ensure_started(client)
+    sess = client.session
+    rid = sess._next_request_id()
+    payload = sess.build_payload(method, rid)
+    fut = asyncio.get_event_loop().create_future()
+    sess._pending_requests[rid] = fut
+    await sess.ws.send_bytes(payload)
+    resp = await asyncio.wait_for(fut, timeout=timeout)
+    if getattr(resp, "error", None):
+        raise RuntimeError(f"bale error: {resp.error}")
+    return resp.result  # the raw decoded dict
+
+
+def _g(d, *keys):
+    """Get a key from a dict trying both str and int forms."""
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if k in d:
+            return d[k]
+        if str(k) in d:
+            return d[str(k)]
+    return None
+
+
+def _extract_dialog_peers(raw: dict):
+    """raw['3'] = list of dialogs; each dialog's peer at key '1' = {'1':type,'2':id}.
+    Returns list of {'id','type'} skipping the message content that crashes."""
+    dialogs = _g(raw, "3", 3) or []
+    if isinstance(dialogs, dict):
+        dialogs = [dialogs]
+    out = []
+    for d in dialogs:
+        peer = _g(d, "1", 1) or {}
+        ptype = _g(peer, "1", 1)
+        pid = _g(peer, "2", 2)
+        if pid is None:
+            continue
+        out.append({"id": int(pid), "type": int(ptype) if ptype is not None else 0})
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 3+4) READ contacts + dialogs (PV vs GROUP, جدا جدا) — RAW, crash-proof
 # --------------------------------------------------------------------------- #
 async def read_everything(client: "Client"):
-    # ---- contacts (مخاطبین / دوطرفه‌ها) ----
-    contacts = await call_probe(client, "CONTACTS", client.load_contacts)
-    if contacts is not None:
-        log("📇 CONTACTS", f"تعداد مخاطبین: {len(contacts)}")
-        for i, c in enumerate(contacts[:50], 1):
-            log("   •", f"{i}. {dump(c)}")
-        if len(contacts) > 50:
-            log("   …", f"و {len(contacts) - 50} مخاطبِ دیگه")
+    pv, groups = [], []
 
-    # ---- dialogs (چت‌ها) -> جدا کردنِ PV از GROUP ----
-    dialogs = await call_probe(
-        client, "DIALOGS", lambda: client.load_dialogs(limit=200))
-    if dialogs is not None:
-        pv, groups, other = [], [], []
-        for d in dialogs:
-            peer = getattr(d, "peer", None)
-            kind = _peer_kind(peer)
-            (pv if kind == "PV" else groups if kind == "GROUP" else other).append(d)
-        log("💬 DIALOGS", f"کل: {len(dialogs)}  |  PV: {len(pv)}  "
-                          f"GROUP: {len(groups)}  OTHER: {len(other)}")
-        log("📥 PV (پیوی‌ها):")
-        for i, d in enumerate(pv[:40], 1):
-            log("   •", f"{i}. {dump(getattr(d, 'peer', d))}")
-        log("👥 GROUPS (گروه‌ها):")
-        for i, d in enumerate(groups[:40], 1):
-            log("   •", f"{i}. {dump(getattr(d, 'peer', d))}")
-        if other:
-            log("❓ OTHER:")
-            for i, d in enumerate(other[:20], 1):
-                log("   •", f"{i}. {dump(getattr(d, 'peer', d))}")
-        return pv, groups
-    return [], []
+    # ---- dialogs via RAW request (the reliable path) ----
+    if LoadDialogs is not None:
+        try:
+            raw = await _raw_request(
+                client, LoadDialogs(offset_date=-1, limit=200, exclude_pinned=False))
+            # dump first 2 raw dialogs so we SEE the real structure
+            rd = _g(raw, "3", 3) or []
+            if isinstance(rd, dict):
+                rd = [rd]
+            log("📦 RAW-DIALOGS", f"تعداد خام: {len(rd)} — نمونه‌ی ۲ موردِ اول:")
+            for i, d in enumerate(rd[:2], 1):
+                log("   raw", f"{i}. {str(d)[:600]}")
+
+            peers = _extract_dialog_peers(raw)
+            pv = [p for p in peers if p["type"] == int(PeerType.PRIVATE)]
+            groups = [p for p in peers if p["type"] == int(PeerType.GROUP)]
+            other = [p for p in peers if p["type"] not in
+                     (int(PeerType.PRIVATE), int(PeerType.GROUP))]
+            log("💬 DIALOGS", f"کل: {len(peers)}  |  📥 PV: {len(pv)}  "
+                             f"👥 GROUP: {len(groups)}  ❓ OTHER: {len(other)}")
+            log("📥 PV (پیوی‌ها):")
+            for i, p in enumerate(pv[:60], 1):
+                log("   •", f"{i}. id={p['id']}  type={p['type']}")
+            log("👥 GROUPS (گروه‌ها):")
+            for i, p in enumerate(groups[:60], 1):
+                log("   •", f"{i}. id={p['id']}  type={p['type']}")
+            if other:
+                log("❓ OTHER:")
+                for i, p in enumerate(other[:30], 1):
+                    log("   •", f"{i}. id={p['id']}  type={p['type']}")
+        except Exception as e:  # noqa: BLE001
+            logx("❌ DIALOGS(raw)", e)
+    else:
+        log("⏭ DIALOGS", "LoadDialogs وارد نشد — رد شد")
+
+    # ---- contacts via RAW (just to SEE the structure; may differ per account) ----
+    if GetContacts is not None:
+        try:
+            rawc = await _raw_request(client, GetContacts())
+            log("📦 RAW-CONTACTS", f"ساختار خامِ مخاطبین: {str(rawc)[:900]}")
+        except Exception as e:  # noqa: BLE001
+            logx("❌ CONTACTS(raw)", e)
+
+    return pv, groups
 
 
 # --------------------------------------------------------------------------- #
@@ -241,27 +311,27 @@ async def send_tests(client: "Client", pv, groups):
         except Exception as e:  # noqa: BLE001
             logx("❌ SEND-SELF", e)
 
-    # 5b) optional: send to the FIRST contact (with confirmation)
-    ans = input("یه پیامِ تست به اولین مخاطب بفرستم؟ (y/N): ").strip().lower()
+    # 5b) optional: send to the FIRST private chat (with confirmation)
+    ans = input("یه پیامِ تست به اولین پیوی بفرستم؟ (y/N): ").strip().lower()
     if ans == "y" and pv:
-        peer = getattr(pv[0], "peer", None)
+        p = pv[0]
         try:
             msg = await client.send_message(
                 text="🧪 تست ارسال (نادیده بگیر)",
-                chat_id=int(getattr(peer, "id")), chat_type=_chat_type_for(peer))
-            log("✅ SEND-PV", f"به اولین پیوی ارسال شد. {dump(msg)}")
+                chat_id=int(p["id"]), chat_type=ChatType.PRIVATE)
+            log("✅ SEND-PV", f"به اولین پیوی (id={p['id']}) ارسال شد. {dump(msg)}")
         except Exception as e:  # noqa: BLE001
             logx("❌ SEND-PV", e)
 
     # 5c) optional: send to the FIRST group (with confirmation)
     ans = input("یه پیامِ تست به اولین گروه بفرستم؟ (y/N): ").strip().lower()
     if ans == "y" and groups:
-        peer = getattr(groups[0], "peer", None)
+        p = groups[0]
         try:
             msg = await client.send_message(
                 text="🧪 تست ارسال (نادیده بگیر)",
-                chat_id=int(getattr(peer, "id")), chat_type=_chat_type_for(peer))
-            log("✅ SEND-GROUP", f"به اولین گروه ارسال شد. {dump(msg)}")
+                chat_id=int(p["id"]), chat_type=ChatType.GROUP)
+            log("✅ SEND-GROUP", f"به اولین گروه (id={p['id']}) ارسال شد. {dump(msg)}")
         except Exception as e:  # noqa: BLE001
             logx("❌ SEND-GROUP", e)
 
