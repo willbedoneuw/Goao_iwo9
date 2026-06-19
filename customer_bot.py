@@ -1257,6 +1257,12 @@ async def run_health_check(uid: int):
     rows = []
     for a in accounts:
         phone = a["phone"]
+        # skip an account that's mid-send / mid-export: verifying it opens a
+        # SECOND connection on the same session, which makes Rubika revoke it
+        # (invalid_auth). It's already known to be in use, so it's alive.
+        if a["id"] in active_jobs:
+            rows.append(f"• {phone} : 🟡 در حال ارسال/پردازش — رد شد")
+            continue
         w = worker.worker_for_account(a)
         try:
             if w and not worker.is_local(w):
@@ -1833,6 +1839,12 @@ async def pvexport_run_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
+    # don't open a connection on an account that's mid-send (second connection
+    # on one session => Rubika revokes it / invalid_auth).
+    if aid in active_jobs:
+        await event.answer("روی این اکانت ارسال در حال اجراست. بعد از اتمام دوباره بزن.",
+                           alert=True)
+        return
     # PV export is memory-heavy; cap concurrency to protect the server (anti-OOM).
     if uid in pv_export_jobs:
         await event.answer("ایمپورت قبلی‌ات هنوز در حال اجراست. صبر کن تموم بشه.",
@@ -1851,10 +1863,14 @@ async def pvexport_run_cb(event):
 
 
 async def run_pv_export(uid: int, acc):
+    # mark the account busy for the whole export so a concurrent send /
+    # health-check can't open a SECOND connection on the same session.
+    active_jobs.add(acc["id"])
     # Always release the global export slot + stop flag, however this finishes.
     try:
         await _run_pv_export(uid, acc)
     finally:
+        active_jobs.discard(acc["id"])
         pv_export_jobs.discard(uid)
         pv_export_stop.discard(uid)
 
