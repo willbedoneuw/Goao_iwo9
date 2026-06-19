@@ -324,6 +324,16 @@ async def handle_phone(event, st):
     if not phone or len(phone) < 10:
         await event.respond("شماره نامعتبره. دوباره بفرست.")
         return
+    # if this phone is an account that's mid-send / mid-export, re-login would
+    # open a SECOND connection on the same session and Rubika would revoke it.
+    busy = next((a for a in db.list_accounts(uid)
+                 if rb.normalize_phone(a["phone"]) == phone
+                 and a["id"] in active_jobs), None)
+    if busy:
+        state.pop(uid, None)
+        await event.respond("روی این اکانت ارسال/پردازش در حال اجراست. "
+                            "بعد از اتمام دوباره تلاش کن.", buttons=main_menu())
+        return
     await account_conn.close(phone)
     msg = await event.respond("⏳ در حال ارسال کد ورود ...")
     try:
@@ -516,6 +526,12 @@ async def run_health_check(uid: int):
     rows = []
     for a in accounts:
         phone = a["phone"]
+        # don't probe an account that's mid-send / mid-export: verifying it
+        # opens a SECOND connection on the same session, which makes Rubika
+        # revoke it ("invalid_auth"). Skip it — it's already known to be alive.
+        if a["id"] in active_jobs:
+            rows.append(f"• {phone} : 🟡 در حال ارسال/پردازش — رد شد")
+            continue
         try:
             is_dead = await account_conn.verify_session_dead(phone)
         except Exception:
@@ -641,6 +657,9 @@ async def send_prepare_cb(event):
         return
     marker = db.get_marker(uid)
     await _respond(event, f"⏳ پیدا کردن پیامِ نشان‌دار «{marker}» و آماده‌سازی لیست ...")
+    # mark busy for the prepare connection too (find-marker + read contacts open
+    # a real connection); cleared in finally so the confirm step can proceed.
+    active_jobs.add(aid)
     await account_conn.close(acc["phone"])
     client = rb.open_client(acc["phone"])
     try:
@@ -665,6 +684,7 @@ async def send_prepare_cb(event):
             await client.disconnect()
         except Exception:
             pass
+        active_jobs.discard(aid)
 
     recipients = [r["guid"] for r in ordered]
     pending_send[aid] = {"customer_id": uid, "account_id": aid,
@@ -772,6 +792,17 @@ async def run_send(payload: dict):
                 except Exception as e:  # noqa: BLE001
                     fail += 1
                     attempt_fail += 1
+                    # explicit Rubika session-revoked signal: confirm on a fresh
+                    # connection, then stop the run cleanly (don't keep hammering
+                    # a dead session until MAX_ERRORS).
+                    if account_conn.is_auth_error(e):
+                        try:
+                            if await account_conn.verify_session_dead(phone):
+                                reason = "سشن باطل شد (نیاز به افزودن مجدد اکانت)"
+                                db.set_status(account_id, "inactive")
+                                break
+                        except Exception:
+                            pass
                     await logbus.to_group(card("⚠️ SEND ERROR", [
                         f"📱 {phone}", f"🎯 {guid}", f"💥 {repr(e)[:160]}"]))
                     if attempt_fail >= config.MAX_ERRORS:
@@ -864,6 +895,10 @@ async def pvexport_run_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
+    if aid in active_jobs:
+        await event.answer("روی این اکانت ارسال/پردازش در حال اجراست. "
+                           "بعد از اتمام دوباره بزن.", alert=True)
+        return
     await _respond(event,
                    f"⏳ جمع‌آوری عکس‌های پیویِ {acc['phone']} ... ممکنه چند دقیقه طول بکشه.",
                    buttons=[[Button.inline("🏠 منو", b"home")]])
@@ -888,6 +923,10 @@ async def run_pv_export(uid: int, acc):
                     return out
         return out
 
+    # mark the account busy for its whole connection life so a concurrent
+    # send / health-check / re-login can't open a SECOND connection on the
+    # same session (two connections on one session => Rubika "invalid_auth").
+    active_jobs.add(acc["id"])
     try:
         photos = await account_conn.call(phone, _do, timeout=1800)
     except account_conn.InvalidAuthError:
@@ -897,6 +936,8 @@ async def run_pv_export(uid: int, acc):
     except Exception as e:  # noqa: BLE001
         await _safe_send(uid, f"❌ جمع‌آوری ناموفق: {repr(e)[:140]}")
         return
+    finally:
+        active_jobs.discard(acc["id"])
 
     if not photos:
         await _safe_send(uid, f"ℹ️ هیچ عکسی در پیوی‌های {phone} پیدا نشد.")
