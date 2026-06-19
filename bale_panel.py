@@ -42,6 +42,7 @@ import config
 import db
 import logbus
 import ratelimit
+import forcedjoin
 
 # aiobale is imported lazily in setup() so the module stays importable even if
 # the package isn't installed yet (the rest of the bot keeps working).
@@ -105,6 +106,8 @@ async def _gate(event) -> bool:
         return False
     if not await ratelimit.guard(uid, name):
         await _respond(event, "⛔ به‌خاطر فعالیت بیش از حد، حساب شما مسدود شد.")
+        return False
+    if not await forcedjoin.enforce(bot, event):
         return False
     cust = db.get_customer(uid) or {}
     if config.FREE_MODE:
