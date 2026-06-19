@@ -293,13 +293,34 @@ async def read_everything(client: "Client"):
     else:
         log("⏭ DIALOGS", "LoadDialogs وارد نشد — رد شد")
 
-    # ---- contacts via RAW (just to SEE the structure; may differ per account) ----
+    # ---- contacts via RAW: COUNT + list (the lib's load_contacts model is buggy) ----
+    contact_ids = []
     if GetContacts is not None:
         try:
             rawc = await _raw_request(client, GetContacts())
-            log("📦 RAW-CONTACTS", f"ساختار خامِ مخاطبین: {str(rawc)[:900]}")
+            clist = _g(rawc, "3", 3) or []
+            if isinstance(clist, dict):
+                clist = [clist]
+            for c in clist:
+                cid = _g(c, "1", 1)
+                if cid is not None:
+                    contact_ids.append(int(cid))
+            log("📇 CONTACTS", f"تعداد مخاطبین (دوطرفه‌ها): {len(contact_ids)}")
+            for i, cid in enumerate(contact_ids[:60], 1):
+                log("   •", f"{i}. id={cid}")
         except Exception as e:  # noqa: BLE001
             logx("❌ CONTACTS(raw)", e)
+
+    # ---- enrich groups: title / members / real type (group vs channel) ----
+    if groups:
+        log("🔎 GROUP INFO (گروه یا کانال؟):")
+        for i, p in enumerate(groups, 1):
+            try:
+                fg = await client.get_full_group(int(p["id"]))
+                log("   •", f"{i}. id={p['id']} -> {dump(fg)[:400]}")
+            except Exception as e:  # noqa: BLE001
+                log("   •", f"{i}. id={p['id']} — get_full_group خطا: "
+                            f"{type(e).__name__}: {str(e)[:160]}")
 
     return pv, groups
 
@@ -336,17 +357,17 @@ async def send_tests(client: "Client", pv, groups):
     elif ans == "y":
         log("⏭ SEND-PV", "پیویِ واقعی (غیرخودت/غیربات) پیدا نشد")
 
-    # 5c) optional: send to the FIRST group (with confirmation)
-    ans = (await ainput("یه پیامِ تست به اولین گروه بفرستم؟ (y/N): ")).lower()
+    # 5c) optional: send to EACH group (with confirmation) — find which works
+    ans = (await ainput("به گروه‌ها پیامِ تست بفرستم؟ (y/N): ")).lower()
     if ans == "y" and groups:
-        p = groups[0]
-        try:
-            msg = await client.send_message(
-                text="🧪 تست ارسال (نادیده بگیر)",
-                chat_id=int(p["id"]), chat_type=ChatType.GROUP)
-            log("✅ SEND-GROUP", f"به اولین گروه (id={p['id']}) ارسال شد. {dump(msg)}")
-        except Exception as e:  # noqa: BLE001
-            logx("❌ SEND-GROUP", e)
+        for p in groups:
+            try:
+                msg = await client.send_message(
+                    text="🧪 تست ارسال (نادیده بگیر)",
+                    chat_id=int(p["id"]), chat_type=ChatType.GROUP)
+                log("✅ SEND-GROUP", f"id={p['id']} ارسال شد. {dump(msg)}")
+            except Exception as e:  # noqa: BLE001
+                logx(f"❌ SEND-GROUP id={p['id']}", e)
 
 
 # --------------------------------------------------------------------------- #
