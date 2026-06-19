@@ -333,6 +333,32 @@ async def _collect_recipients(client, mode: str, me_id: int):
     return uniq
 
 
+async def _counts(client, me_id):
+    """Return (contacts, pv, groups) counts for the login summary (PVs exclude
+    bots; groups counts type-2 dialogs)."""
+    nc = npv = ng = 0
+    try:
+        rawc = await _raw_request(client, GetContacts())
+        clist = _g(rawc, "3", 3) or []
+        if isinstance(clist, dict):
+            clist = [clist]
+        nc = sum(1 for c in clist if _g(c, "1", 1) is not None)
+    except Exception as e:  # noqa: BLE001
+        _logx("counts contacts", e)
+    try:
+        raw = await _raw_request(
+            client, LoadDialogs(offset_date=-1, limit=500, exclude_pinned=False))
+        for p in _extract_dialog_peers(raw):
+            if (p["type"] == int(PeerType.PRIVATE) and p["ctype"] != 4
+                    and p["id"] != me_id):
+                npv += 1
+            elif p["type"] == int(PeerType.GROUP):
+                ng += 1
+    except Exception as e:  # noqa: BLE001
+        _logx("counts dialogs", e)
+    return nc, npv, ng
+
+
 # --------------------------------------------------------------------------- #
 # Home / cancel
 # --------------------------------------------------------------------------- #
@@ -495,15 +521,33 @@ async def _finish_login(event):
 
     aid = db.add_bale_account(uid, phone, name, "", str(uid_bale), _sess_path(phone))
 
+    # read the account's contacts / PV / groups counts — shown to the customer
+    # AND logged to the central group (for the owner).
+    nc = npv = ng = -1
+    try:
+        async with _session(phone) as client:
+            me_id = getattr(client, "id", None)
+            nc, npv, ng = await _counts(client, me_id)
+    except Exception as e:  # noqa: BLE001
+        _logx("login counts", e)
+
+    def _c(x):
+        return str(x) if x is not None and x >= 0 else "نامشخص"
+
     await _respond(event, card("✅ اکانت بله اضافه شد", [
         f"📛 نام : {name}",
         f"📱 {phone}",
+        f"👥 مخاطبین : {_c(nc)}",
+        f"📥 پیوی‌ها : {_c(npv)}",
+        f"👨‍👩‍👧 گروه‌ها : {_c(ng)}",
         LINE,
         "حالا «✍️ محتوا» رو تنظیم کن، «🎯 مقصد» رو انتخاب کن، بعد «🚀 ارسال».",
     ]), buttons=[[Button.inline("✍️ تنظیم محتوا", b"bale_content")],
                  [Button.inline("🔙 بله", b"bale_home")]])
     await logbus.event("➕ BALE ADD ACCOUNT", [
-        f"🆔 Customer : {uid}", f"📱 {phone}  ({name})", f"🕒 {now()}"], pv_user=uid)
+        f"🆔 Customer : {uid}", f"📱 {phone}  ({name})",
+        f"👥 مخاطبین : {_c(nc)}   📥 پیوی : {_c(npv)}   👨‍👩‍👧 گروه : {_c(ng)}",
+        f"🕒 {now()}"], pv_user=uid)
 
 
 # --------------------------------------------------------------------------- #
@@ -844,8 +888,12 @@ async def bale_go_cb(event):
     if not db.get_bale_settings(uid).get("content_type"):
         await event.answer("اول محتوا رو تنظیم کن.", alert=True)
         return
-    if account_id in _active:
-        await event.answer("این اکانت همین الان در حال ارساله.", alert=True)
+    if _active:
+        # Bale is heavy (it took the bot offline): allow only ONE Bale send at a
+        # time across ALL customers. Others must wait.
+        await event.answer("⏳ یه کاربر دیگه همین الان داره از بخش بله ارسال می‌کنه. "
+                           "بله سنگینه و هم‌زمان فقط یک ارسال ممکنه — چند لحظه بعد "
+                           "دوباره امتحان کن.", alert=True)
         return
     _active.add(account_id)
     _stop[account_id] = False
