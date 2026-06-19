@@ -83,6 +83,7 @@ def main_menu():
         [Button.inline("🛠 ورکرها", b"workers"),
          Button.inline("🧰 تعمیر/بکاپ", b"sys")],
         [Button.inline("📨 آمار تلگرام", b"tg_owner")],
+        [Button.inline("📢 عضویت اجباری", b"forcedjoin")],
     ]
 
 
@@ -942,6 +943,89 @@ async def _worker_add_flow(event, st):
 
 
 # --------------------------------------------------------------------------- #
+# Forced-join channels management.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"forcedjoin"))
+async def forcedjoin_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    chans = db.list_forced_channels()
+    lines = []
+    rows = []
+    if not chans:
+        lines.append("هیچ کانالی تنظیم نشده — عضویت اجباری خاموشه.")
+    else:
+        for c in chans:
+            mark = "🟢 فعال" if c["enabled"] else "🔴 خاموش"
+            lines.append(f"{mark} — {c.get('title') or c['chat']}  ({c['chat']})")
+            rows.append([
+                Button.inline("🔴 خاموش" if c["enabled"] else "🟢 روشن",
+                              f"fjtog_{c['id']}".encode()),
+                Button.inline("🗑 حذف", f"fjdel_{c['id']}".encode()),
+            ])
+    lines += [LINE, "⚠️ ربات مشتری باید ادمینِ کانال‌ها باشه تا عضویت چک بشه."]
+    rows.append([Button.inline("➕ افزودن کانال", b"fj_add")])
+    rows.append([Button.inline("🔙 منوی اصلی", b"home")])
+    await safe_edit(event, card("📢 عضویت اجباری", lines), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"fj_add"))
+async def fj_add_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_fj_channel"}
+    await safe_edit(event,
+                    "یوزرنیمِ کانال رو بفرست (مثلاً `@mychannel` یا `t.me/mychannel`).\n"
+                    "⚠️ حتماً ربات مشتری رو ادمینِ اون کانال کن.",
+                    buttons=[[Button.inline("🔙 لغو", b"forcedjoin")]])
+
+
+async def _handle_fj_add(event, st):
+    state.pop(event.sender_id, None)
+    raw = (event.raw_text or "").strip()
+    u = raw
+    for pre in ("https://", "http://", "t.me/", "telegram.me/"):
+        u = u.replace(pre, "")
+    u = u.lstrip("@").strip().split("/")[0].split("?")[0]
+    if not u:
+        await event.respond("یوزرنیمِ کانال نامعتبره.", buttons=main_menu())
+        return
+    chat = "@" + u
+    ok = db.add_forced_channel(chat, u, f"https://t.me/{u}")
+    if not ok:
+        await event.respond("این کانال قبلاً اضافه شده.",
+                            buttons=[[Button.inline("📢 عضویت اجباری", b"forcedjoin")]])
+        return
+    await logbus.to_group(card("📢 FORCED CHANNEL ADDED", [f"📢 {chat}", f"🕒 {now()}"]))
+    await event.respond(card("✅ کانال اضافه شد", [
+        f"📢 {chat}", LINE,
+        "⚠️ مطمئن شو ربات مشتری ادمینِ این کاناله، وگرنه چک عضویت کار نمی‌کنه."]),
+        buttons=[[Button.inline("📢 عضویت اجباری", b"forcedjoin")],
+                 [Button.inline("🔙 منوی اصلی", b"home")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"fjtog_(\\d+)"))
+async def fjtog_cb(event):
+    if not is_owner(event):
+        return
+    cid = int(event.pattern_match.group(1))
+    c = db.get_forced_channel(cid)
+    if c:
+        db.set_forced_channel_enabled(cid, not c["enabled"])
+    await forcedjoin_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"fjdel_(\\d+)"))
+async def fjdel_cb(event):
+    if not is_owner(event):
+        return
+    cid = int(event.pattern_match.group(1))
+    db.delete_forced_channel(cid)
+    await forcedjoin_cb(event)
+
+
+# --------------------------------------------------------------------------- #
 # Free-text router.
 # --------------------------------------------------------------------------- #
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not (e.raw_text or "").startswith("/")))
@@ -974,6 +1058,8 @@ async def text_router(event):
         await _handle_tolerance(event)
     elif step in ("w_ip", "w_port", "w_user", "w_pass"):
         await _worker_add_flow(event, st)
+    elif step == "await_fj_channel":
+        await _handle_fj_add(event, st)
 
 
 async def _handle_addcust(event):

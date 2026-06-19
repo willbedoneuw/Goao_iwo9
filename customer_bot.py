@@ -37,6 +37,7 @@ import ratelimit
 import rubika_client as rb
 import tg_panel
 import bale_panel
+import forcedjoin
 import tron
 import worker
 
@@ -166,6 +167,10 @@ async def _gate(event, *, need_active: bool = True) -> bool:
                               "برای رفع مسدودی با پشتیبانی در تماس باش.")
         return False
 
+    # forced-join: must be a member of all required channels (owner exempt)
+    if not await forcedjoin.enforce(bot, event):
+        return False
+
     if need_active:
         if config.FREE_MODE:
             # Free: allowed unless the owner set an expiry that has now passed.
@@ -266,6 +271,30 @@ async def home_cb(event):
     header = _sub_line(event.sender_id)
     await _respond(event, f"🤖 روبیکا تولز\n{LINE}\n{header}\n\nیکی از گزینه‌ها رو انتخاب کن:",
                    buttons=main_menu())
+
+
+@bot.on(events.CallbackQuery(data=b"fj_check"))
+async def fj_check_cb(event):
+    """Re-check forced-join membership after the user pressed «عضو شدم»."""
+    uid = event.sender_id
+    if db.is_blocked(uid):
+        return
+    missing = await forcedjoin.missing_for(bot, uid)
+    if missing:
+        await event.answer("هنوز عضو همهٔ کانال‌ها نشدی! بعد از عضویت دوباره بزن.",
+                           alert=True)
+        return
+    await event.answer("✅ عضو شدی! خوش اومدی.")
+    state.pop(uid, None)
+    tg_panel._state.pop(uid, None)
+    try:
+        bale_panel._state.pop(uid, None)
+    except Exception:
+        pass
+    header = _sub_line(uid)
+    await _respond(event, f"🤖 پنل ربات\n{LINE}\n{header}\n\n"
+                          "کدوم بخش؟ 🟣 روبیکا / 📨 تلگرام / 🔵 بله:",
+                   buttons=root_menu())
 
 
 @bot.on(events.CallbackQuery(data=b"cancel"))

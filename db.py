@@ -260,6 +260,20 @@ def init():
         """
     )
 
+    # Forced-join channels: customers must be members before using the bot.
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS forced_channels (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat      TEXT UNIQUE,
+            title     TEXT,
+            link      TEXT,
+            enabled   INTEGER DEFAULT 1,
+            added_at  TEXT
+        )
+        """
+    )
+
     # ---- Add balance column to customers if not present ----
     try:
         c.execute("ALTER TABLE customers ADD COLUMN balance REAL DEFAULT 0")
@@ -1356,5 +1370,61 @@ def incr_bale_sends(customer_id: int, n: int = 1):
     _ensure_bale_settings(c, customer_id)
     c.execute("UPDATE bale_settings SET total_sends = total_sends + ? "
               "WHERE customer_id = ?", (int(n), int(customer_id)))
+    conn.commit()
+    conn.close()
+
+
+
+# =========================================================================== #
+# Forced-join channels (customers must join before using the bot).
+# =========================================================================== #
+def add_forced_channel(chat: str, title: str = "", link: str = "") -> bool:
+    """Add a required channel (chat = @username). Returns False if it already
+    exists."""
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO forced_channels (chat, title, link, enabled, added_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (chat, title or chat, link, _now()),
+        )
+        conn.commit()
+        ok = True
+    except sqlite3.IntegrityError:
+        ok = False
+    conn.close()
+    return ok
+
+
+def list_forced_channels(only_enabled: bool = False) -> list:
+    conn = _conn()
+    if only_enabled:
+        rows = conn.execute(
+            "SELECT * FROM forced_channels WHERE enabled = 1 ORDER BY id").fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM forced_channels ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_forced_channel(channel_id: int):
+    conn = _conn()
+    row = conn.execute("SELECT * FROM forced_channels WHERE id = ?",
+                       (int(channel_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_forced_channel(channel_id: int):
+    conn = _conn()
+    conn.execute("DELETE FROM forced_channels WHERE id = ?", (int(channel_id),))
+    conn.commit()
+    conn.close()
+
+
+def set_forced_channel_enabled(channel_id: int, enabled: bool):
+    conn = _conn()
+    conn.execute("UPDATE forced_channels SET enabled = ? WHERE id = ?",
+                 (1 if enabled else 0, int(channel_id)))
     conn.commit()
     conn.close()

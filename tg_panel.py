@@ -38,6 +38,7 @@ import config
 import db
 import logbus
 import ratelimit
+import forcedjoin
 
 # Telethon is imported lazily inside setup to keep this module importable even
 # if a tool only wants the helpers.
@@ -90,6 +91,8 @@ async def _gate(event) -> bool:
         return False
     if not await ratelimit.guard(uid, name):
         await _respond(event, "⛔ به‌خاطر فعالیت بیش از حد، حساب شما مسدود شد.")
+        return False
+    if not await forcedjoin.enforce(bot, event):
         return False
     cust = db.get_customer(uid) or {}
     if config.FREE_MODE:
