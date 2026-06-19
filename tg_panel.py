@@ -136,10 +136,19 @@ def _menu():
          Button.inline("🩺 چک‌حساب", b"tg_health")],
         [Button.inline("✍️ محتوا", b"tg_content"),
          Button.inline("⚙️ سرعت/تاخیر", b"tg_speed")],
+        [Button.inline("🎯 مقصد ارسال", b"tg_target")],
         [Button.inline("📊 آمار من", b"tg_stats"),
          Button.inline("📖 راهنما", b"tg_help")],
         [Button.inline("🏠 منوی اصلی", b"mainmenu")],
     ]
+
+
+def _target_label(mode: str) -> str:
+    return {
+        "both": "دوطرفه‌ها + گروه‌ها",
+        "contacts": "فقط دوطرفه‌ها",
+        "groups": "فقط گروه‌ها",
+    }.get(mode or "both", "دوطرفه‌ها + گروه‌ها")
 
 
 def _back_home():
@@ -581,6 +590,46 @@ async def tg_spd_cb(event):
 
 
 # --------------------------------------------------------------------------- #
+# Target mode (where to send: mutual contacts, groups, or both) — selectable.
+# --------------------------------------------------------------------------- #
+async def tg_target_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    cur = db.get_tg_settings(uid).get("target_mode") or "both"
+
+    def _mk(m, label):
+        return Button.inline(("✅ " if cur == m else "") + label,
+                             f"tg_tgt_{m}".encode())
+
+    rows = [
+        [_mk("both", "دوطرفه‌ها + گروه‌ها")],
+        [_mk("contacts", "فقط دوطرفه‌ها")],
+        [_mk("groups", "فقط گروه‌ها")],
+        [Button.inline("🔙 تلگرام", b"tg_home")],
+    ]
+    await _respond(event, card("🎯 تلگرام › مقصد ارسال", [
+        f"مقصد فعلی : {_target_label(cur)}",
+        LINE,
+        "محتوا به کجا ارسال بشه؟",
+        "• دوطرفه‌ها + گروه‌ها (پیش‌فرض)",
+        "• فقط دوطرفه‌ها (کم‌ریسک‌تر؛ گروه‌ها نادیده می‌شن)",
+        "• فقط گروه‌ها",
+    ]), buttons=rows)
+
+
+async def tg_tgt_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    mode = event.data.decode().rsplit("_", 1)[-1]   # both | contacts | groups
+    db.set_tg_target_mode(uid, mode)
+    await logbus.event("🎯 TG TARGET MODE", [
+        f"🆔 {uid}", f"مقصد : {_target_label(mode)}", f"🕒 {now()}"], pv_user=uid)
+    await tg_target_cb(event)
+
+
+# --------------------------------------------------------------------------- #
 # My stats
 # --------------------------------------------------------------------------- #
 async def tg_stats_cb(event):
@@ -606,9 +655,10 @@ async def tg_help_cb(event):
     await _respond(event, card("📖 راهنمای بخش تلگرام", [
         "➕ افزودن اکانت : شماره → کد → (در صورت لزوم) رمز دومرحله‌ای.",
         "✍️ محتوا : متن یا عکس/فایل با کپشن که ارسال می‌شه.",
-        "🚀 ارسال : محتوا به مخاطب‌های دوطرفه + گروه‌های همون اکانت می‌ره؛",
+        "🚀 ارسال : محتوا به مقصدی که انتخاب کردی می‌ره (دوطرفه‌ها/گروه‌ها/هردو)؛",
         "   پیشرفت زنده نشون داده می‌شه و دکمهٔ «⛔ توقف» داری.",
-        f"   اگه به {config.TG_MAX_ERRORS} خطا برسه، خودکار متوقف می‌شه.",
+        f"   فقط اگه به {config.TG_MAX_ERRORS} خطای پیاپی برسه متوقف می‌شه.",
+        "🎯 مقصد ارسال : انتخاب کن به دوطرفه‌ها، گروه‌ها یا هردو ارسال شه.",
         "🩺 چک‌حساب : زنده‌بودن سشنِ اکانت‌ها رو بررسی می‌کنه.",
         "⚙️ سرعت/تاخیر : فاصلهٔ بین ارسال‌ها (برای کم‌کردن محدودیت).",
         "📊 آمار من : تعداد اکانت و کل ارسال‌ها.",
@@ -639,7 +689,8 @@ async def tg_send_cb(event):
         "محتوایی که ارسال می‌شه:",
         _content_summary(s),
         LINE,
-        "به مخاطب‌های دوطرفه + گروه‌ها ارسال می‌شه. مطمئنی؟",
+        f"🎯 مقصد : {_target_label(s.get('target_mode') or 'both')}",
+        "مطمئنی؟ (از «🎯 مقصد ارسال» می‌تونی عوضش کنی)",
     ]), buttons=[[Button.inline("✅ بله، شروع کن", f"tg_go_{account_id}".encode())],
                  [Button.inline("🔙 خیر", f"tg_acc_{account_id}".encode())]])
 
@@ -683,12 +734,31 @@ async def _get_groups(client):
     return groups
 
 
-async def _collect_recipients(client):
-    """Mutual contacts + groups (same as the reference panel)."""
-    result = await client(GetContactsRequest(hash=0))
-    mutual = [u for u in result.users if getattr(u, "mutual_contact", False)]
-    groups = await _get_groups(client)
+async def _collect_recipients(client, mode: str = "both"):
+    """Build the recipient list per the customer's chosen target mode:
+    'both' = mutual contacts + groups, 'contacts' = mutual contacts only,
+    'groups' = groups only."""
+    mutual = []
+    groups = []
+    if mode in ("both", "contacts"):
+        result = await client(GetContactsRequest(hash=0))
+        mutual = [u for u in result.users if getattr(u, "mutual_contact", False)]
+    if mode in ("both", "groups"):
+        groups = await _get_groups(client)
     return list(mutual) + list(groups)
+
+
+async def _sleep_or_stop(account_id, seconds: float, step: float = 2.0) -> bool:
+    """Sleep up to `seconds` but bail out early (return True) if the customer
+    pressed STOP — keeps the stop button responsive during a FloodWait wait."""
+    waited = 0.0
+    while waited < seconds:
+        if _stop.get(account_id):
+            return True
+        d = min(step, seconds - waited)
+        await asyncio.sleep(d)
+        waited += d
+    return False
 
 
 async def _prepare_media(client, s):
@@ -728,6 +798,7 @@ async def _do_send(job):
     ok = fail = total = 0
     stopped = False
     hit_max = False
+    flood_stop = 0          # >0 => stopped because Telegram asked too long a wait
     started = datetime.now()
     try:
         await client.connect()
@@ -739,34 +810,63 @@ async def _do_send(job):
                 f"🆔 {uid}", f"📱 {acc['phone']}", f"🕒 {now()}"], pv_user=uid)
             return
 
-        recipients = await _collect_recipients(client)
+        mode = s.get("target_mode") or "both"
+        recipients = await _collect_recipients(client, mode)
         total = len(recipients)
         prepared = await _prepare_media(client, s)
 
         await logbus.event("🚀 TG SEND START", [
             f"🆔 {uid}", f"📱 {acc['phone']}", f"🎯 گیرنده : {total}",
+            f"🎯 مقصد : {_target_label(mode)}",
             f"🕒 {now()}"], pv_user=uid)
         await _safe_edit(uid, msg_id, _progress_card(acc, 0, 0, total, 0),
                          buttons=_stop_btn(account_id))
 
         last_edit = 0.0
+        consec_fail = 0          # CONSECUTIVE failures (resets on each success)
         for i, peer in enumerate(recipients, 1):
             if _stop.get(account_id):
                 stopped = True
                 break
             try:
-                await _send_one(client, peer, s, prepared)
+                await asyncio.wait_for(_send_one(client, peer, s, prepared),
+                                       timeout=config.TG_SEND_TIMEOUT)
                 ok += 1
+                consec_fail = 0
             except FloodWaitError as fw:
-                await asyncio.sleep(getattr(fw, "seconds", 5) + 1)
+                wait_s = int(getattr(fw, "seconds", 5))
+                # too long -> don't freeze silently; stop and tell the customer
+                if wait_s > config.TG_FLOODWAIT_MAX:
+                    flood_stop = wait_s
+                    break
+                # short enough -> wait it out, but stay responsive to STOP
+                await logbus.event("⏸ TG FLOODWAIT", [
+                    f"🆔 {uid}", f"📱 {acc['phone']}",
+                    f"⏳ تلگرام {wait_s}s محدودیت گذاشت — صبر و ادامه",
+                    f"📊 ✅ {ok}  ❌ {fail}  از {total}", f"🕒 {now()}"], pv_user=uid)
+                await _safe_edit(uid, msg_id, card("⏸ تلگرام › محدودیت موقت", [
+                    f"📱 {acc['phone']}",
+                    f"⏳ تلگرام {wait_s} ثانیه محدودیت گذاشت.",
+                    "بعد از این مدت ارسال خودکار ادامه پیدا می‌کنه.",
+                    f"📊 ✅ {ok}   ❌ {fail}   از {total}",
+                ]), buttons=_stop_btn(account_id))
+                if await _sleep_or_stop(account_id, wait_s + 1):
+                    stopped = True
+                    break
+                # one retry of the SAME peer after the wait
                 try:
-                    await _send_one(client, peer, s, prepared)
+                    await asyncio.wait_for(_send_one(client, peer, s, prepared),
+                                           timeout=config.TG_SEND_TIMEOUT)
                     ok += 1
+                    consec_fail = 0
                 except Exception:  # noqa: BLE001
                     fail += 1
-            except Exception:  # noqa: BLE001
+                    consec_fail += 1
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
                 fail += 1
-            if fail >= config.TG_MAX_ERRORS:
+                consec_fail += 1
+            # stop only on CONSECUTIVE errors (scattered per-peer fails are normal)
+            if consec_fail >= config.TG_MAX_ERRORS:
                 hit_max = True
                 break
             t = _time.time()
@@ -781,9 +881,13 @@ async def _do_send(job):
             db.incr_tg_sends(uid, ok)
         duration = int((datetime.now() - started).total_seconds())
         rate = f"{(ok / total * 100):.0f}%" if total else "0%"
-        if hit_max:
+        if flood_stop:
+            head = "🛑 TG SEND STOPPED (محدودیت تلگرام)"
+            note = (f"تلگرام این اکانت رو {flood_stop}s محدود کرد (FloodWait). "
+                    "ارسال متوقف شد؛ کمی بعد دوباره بزن یا تأخیر رو بیشتر کن.")
+        elif hit_max:
             head = "🛑 TG SEND STOPPED (سقف خطا)"
-            note = f"به سقفِ {config.TG_MAX_ERRORS} خطا رسید و متوقف شد."
+            note = f"به {config.TG_MAX_ERRORS} خطای پیاپی رسید و متوقف شد."
         elif stopped:
             head = "🛑 TG SEND STOPPED (توسط کاربر)"
             note = "ارسال به‌درخواستِ کاربر متوقف شد."
@@ -887,6 +991,8 @@ def setup(shared_bot, rubika_state=None):
     add(tg_content_cb, events.CallbackQuery(data=b"tg_content"))
     add(tg_speed_cb, events.CallbackQuery(data=b"tg_speed"))
     add(tg_spd_cb, events.CallbackQuery(pattern=b"tg_spd_([0-9.]+)"))
+    add(tg_target_cb, events.CallbackQuery(data=b"tg_target"))
+    add(tg_tgt_cb, events.CallbackQuery(pattern=b"tg_tgt_(both|contacts|groups)"))
     add(tg_stats_cb, events.CallbackQuery(data=b"tg_stats"))
     add(tg_help_cb, events.CallbackQuery(data=b"tg_help"))
     add(tg_send_cb, events.CallbackQuery(pattern=b"tg_send_(\\d+)"))

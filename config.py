@@ -188,8 +188,14 @@ FREE_MODE = _bool("FREE_MODE", True)
 TG_SEND_DELAY = _float("TG_SEND_DELAY", 1.0)      # seconds between each send
 TG_MIN_DELAY = 0.2
 TG_MAX_DELAY = 30.0
-# Tolerate this many failed sends in one run; then stop and report "stopped".
+# Stop a run after this many CONSECUTIVE failed sends (resets on every success),
+# so scattered "can't message this peer" errors don't kill a healthy campaign.
 TG_MAX_ERRORS = _int("TG_MAX_ERRORS", 25)
+# Per-send hard timeout (s): a stuck network/connection call can't freeze a run.
+TG_SEND_TIMEOUT = _int("TG_SEND_TIMEOUT", 60)
+# If Telegram asks to wait MORE than this (s) on a FloodWait, stop the run and
+# tell the customer instead of silently sleeping for ages (looks "frozen").
+TG_FLOODWAIT_MAX = _int("TG_FLOODWAIT_MAX", 300)
 # 0 = unlimited accounts per customer; >0 caps it (anti-abuse, since it's free).
 TG_MAX_ACCOUNTS = _int("TG_MAX_ACCOUNTS", 0)
 
