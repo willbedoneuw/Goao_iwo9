@@ -50,6 +50,7 @@ Client = None
 AuthErrors = ChatType = PeerType = GroupType = None
 FileInput = None
 LoadDialogs = GetContacts = None
+_add_header = _clean_grpc = None
 
 LINE = logbus.LINE
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -227,29 +228,49 @@ def _progress_card(acc, ok, fail, total, done):
 @asynccontextmanager
 async def _session(phone: str):
     client = Client(session_file=_sess_path(phone))
+    # never trigger aiobale's interactive CLI fallback on a missing token
+    if getattr(client, "_Client__token", None) is None:
+        raise RuntimeError("no_session")
     try:
-        await client.start(run_in_background=True, signal_handling=False)
         yield client
     finally:
         try:
-            await client.stop()
+            s = client.session
+            if s and not s.is_closed():
+                await s.close()
         except Exception:
             pass
 
 
-async def _raw_request(client, method, timeout: int = 25):
-    """Send a method and return the RAW decoded dict, skipping aiobale's pydantic
-    models (they crash on bot dialogs / some groups)."""
+async def _raw_request(client, method, timeout: int = 30):
+    """Fire a method over plain HTTP and return the RAW decoded dict (skips
+    aiobale's pydantic models, which crash on bot dialogs / some groups)."""
+    import aiohttp
     sess = client.session
-    rid = sess._next_request_id()
-    payload = sess.build_payload(method, rid)
-    fut = asyncio.get_event_loop().create_future()
-    sess._pending_requests[rid] = fut
-    await sess.ws.send_bytes(payload)
-    resp = await asyncio.wait_for(fut, timeout=timeout)
-    if getattr(resp, "error", None):
-        raise RuntimeError(f"bale error: {resp.error}")
-    return resp.result
+    if sess.session is None or sess.session.closed:
+        sess.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout), proxy=sess.proxy)
+    token = getattr(client, "_Client__token", None)
+    headers = {
+        "User-Agent": sess.user_agent,
+        "Origin": "https://web.bale.ai",
+        "content-type": "application/grpc-web+proto",
+    }
+    try:
+        headers.update({k[0].upper() + k[1:]: v for k, v in sess._get_meta().items()})
+    except Exception:
+        pass
+    if token:
+        headers.update(sess._build_headers(token))
+    url = f"{sess.post_url}/{method.__service__}/{method.__method__}"
+    data = method.model_dump(by_alias=True, exclude_none=True)
+    payload = _add_header(sess.encoder(data))
+    req = await sess.session.post(url=url, headers=headers, data=payload)
+    content = await req.read()
+    gm = req.headers.get("grpc-message")
+    if gm is not None:
+        raise RuntimeError(f"bale grpc: {gm}")
+    return sess.decoder(_clean_grpc(content))
 
 
 def _g(d, *keys):
@@ -1117,7 +1138,7 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
     dicts (for cross-section mutual exclusion)."""
     global bot, _rubika_state, _tg_state
     global Client, AuthErrors, ChatType, PeerType, GroupType, FileInput
-    global LoadDialogs, GetContacts
+    global LoadDialogs, GetContacts, _add_header, _clean_grpc
 
     bot = shared_bot
     _rubika_state = rubika_state
@@ -1129,6 +1150,7 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
                                     PeerType as _PT, GroupType as _GT)
         from aiobale.types import FileInput as _FI
         from aiobale.methods import LoadDialogs as _LD, GetContacts as _GC
+        from aiobale.utils import add_header as _AH, clean_grpc as _CG
     except Exception as e:  # noqa: BLE001
         print(f"[bale] aiobale not available, Bale section disabled: {e!r}")
         return False
@@ -1136,6 +1158,7 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
     Client, AuthErrors, ChatType, PeerType, GroupType, FileInput = (
         _Client, _AE, _CT, _PT, _GT, _FI)
     LoadDialogs, GetContacts = _LD, _GC
+    _add_header, _clean_grpc = _AH, _CG
 
     add = bot.add_event_handler
     add(bale_home_cb, events.CallbackQuery(data=b"bale_home"))
