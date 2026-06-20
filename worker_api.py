@@ -90,7 +90,8 @@ async def _handle_auth_error(phone: str) -> bool:
     it dead. Returns True if the loop should stop (truly dead), False if it was
     a transient error (banned/muted group, hiccup) and the loop should go on."""
     try:
-        dead = await account_conn.verify_session_dead(phone)
+        dead = await asyncio.wait_for(
+            account_conn.verify_session_dead(phone), timeout=45)
     except Exception:
         dead = False
     if dead:

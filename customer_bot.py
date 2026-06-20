@@ -1623,7 +1623,8 @@ async def run_send(payload: dict):
                             pass
                         really_dead = False
                         try:
-                            really_dead = await account_conn.verify_session_dead(phone)
+                            really_dead = await asyncio.wait_for(
+                                account_conn.verify_session_dead(phone), timeout=45)
                         except Exception:
                             really_dead = False
                         if really_dead:
