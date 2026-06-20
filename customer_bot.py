@@ -1612,11 +1612,31 @@ async def run_send(payload: dict):
                         except Exception:
                             pass
                 except Exception as e:  # noqa: BLE001
-                    # dead session never recovers -> stop now, flag for re-add
+                    # An auth-looking error is NOT proof the session is dead — a
+                    # transient hiccup / brief AUTH_FROM_ANOTHER looks the same.
+                    # CONFIRM on a fresh connection before declaring it dead, so a
+                    # healthy account is never falsely flagged (false positive).
                     if account_conn.is_auth_error(e):
-                        reason = "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن"
-                        db.set_status(account_id, "inactive")
-                        break
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        really_dead = False
+                        try:
+                            really_dead = await account_conn.verify_session_dead(phone)
+                        except Exception:
+                            really_dead = False
+                        if really_dead:
+                            reason = "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن"
+                            db.set_status(account_id, "inactive")
+                            break
+                        # confirmed ALIVE -> it was transient; reopen and continue
+                        try:
+                            await account_conn.close(phone)
+                            client = rb.open_client(phone)
+                            await rb.connect_ready(client)
+                        except Exception:
+                            pass
                     fail += 1
                     attempt_fail += 1
                     try:

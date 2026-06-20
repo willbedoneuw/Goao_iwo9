@@ -1277,11 +1277,23 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                     job["ok"] += 1
                     attempt_fail = 0   # count CONSECUTIVE errors only
                 except Exception as e:  # noqa: BLE001
-                    # a dead session (INVALID_AUTH) never recovers by waiting —
-                    # stop the whole run immediately instead of pausing 5 min.
+                    # An auth-looking error is NOT proof the session is dead.
+                    # CONFIRM on a fresh connection before declaring it dead, so a
+                    # transient hiccup never falsely kills a healthy account.
                     if account_conn.is_auth_error(e):
-                        job["reason"] = "invalid_auth"
-                        return
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        if await _handle_auth_error(body.phone):
+                            job["reason"] = "invalid_auth"
+                            return
+                        # confirmed ALIVE -> transient; reopen and keep going
+                        try:
+                            client = rb.open_client(body.phone)
+                            await rb.connect_ready(client)
+                        except Exception:
+                            pass
                     job["fail"] += 1
                     attempt_fail += 1
                     job["last_error"] = repr(e)[:200]
