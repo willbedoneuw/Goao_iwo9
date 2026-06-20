@@ -51,6 +51,7 @@ AuthErrors = ChatType = PeerType = GroupType = None
 FileInput = None
 LoadDialogs = GetContacts = None
 _add_header = _clean_grpc = None
+_BALE_CLIENTS = None   # ref to aiobale's global client registry (to avoid leaks)
 
 LINE = logbus.LINE
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -89,6 +90,16 @@ def _sess_path(phone: str) -> str:
 
 def _phone_int(phone: str) -> int:
     return int("".join(ch for ch in str(phone) if ch.isdigit()))
+
+
+def _drop_client(client):
+    """Remove a client from aiobale's global registry so connect-on-demand
+    clients (which never call start()) don't pile up there (memory leak)."""
+    try:
+        if _BALE_CLIENTS is not None:
+            _BALE_CLIENTS.discard(client)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -230,6 +241,7 @@ async def _session(phone: str):
     client = Client(session_file=_sess_path(phone))
     # never trigger aiobale's interactive CLI fallback on a missing token
     if getattr(client, "_Client__token", None) is None:
+        _drop_client(client)
         raise RuntimeError("no_session")
     try:
         yield client
@@ -240,6 +252,7 @@ async def _session(phone: str):
                 await s.close()
         except Exception:
             pass
+        _drop_client(client)
 
 
 async def _raw_request(client, method, timeout: int = 30):
@@ -409,6 +422,7 @@ async def bale_cancel_cb(event):
             await p["client"].stop()
         except Exception:
             pass
+        _drop_client(p["client"])
     _state.pop(uid, None)
     await _respond(event, "لغو شد.", buttons=_menu())
 
@@ -454,12 +468,14 @@ async def _handle_phone(event, st):
             await client.stop()
         except Exception:
             pass
+        _drop_client(client)
         return
     if isinstance(resp, AuthErrors):
         try:
             await client.stop()
         except Exception:
             pass
+        _drop_client(client)
         await event.respond(f"❌ ارسال کد ناموفق: {resp.name}\nدوباره شماره رو بفرست یا لغو کن.")
         return
     _pending[uid] = {"client": client, "phone": phone,
@@ -542,6 +558,7 @@ async def _finish_login(event):
         await client.stop()
     except Exception:
         pass
+    _drop_client(client)
 
     aid = db.add_bale_account(uid, phone, name, "", str(uid_bale), _sess_path(phone))
 
@@ -1138,7 +1155,7 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
     dicts (for cross-section mutual exclusion)."""
     global bot, _rubika_state, _tg_state
     global Client, AuthErrors, ChatType, PeerType, GroupType, FileInput
-    global LoadDialogs, GetContacts, _add_header, _clean_grpc
+    global LoadDialogs, GetContacts, _add_header, _clean_grpc, _BALE_CLIENTS
 
     bot = shared_bot
     _rubika_state = rubika_state
@@ -1159,6 +1176,11 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
         _Client, _AE, _CT, _PT, _GT, _FI)
     LoadDialogs, GetContacts = _LD, _GC
     _add_header, _clean_grpc = _AH, _CG
+    try:
+        from aiobale.client.client import _CLIENTS as _BC
+        _BALE_CLIENTS = _BC
+    except Exception:
+        _BALE_CLIENTS = None
 
     add = bot.add_event_handler
     add(bale_home_cb, events.CallbackQuery(data=b"bale_home"))
