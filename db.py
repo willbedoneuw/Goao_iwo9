@@ -36,8 +36,11 @@ def _now() -> str:
 
 def _conn():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # timeout + busy_timeout: owner and customer processes share customer.db, so
+    # wait for a held write lock instead of instantly raising "database is locked".
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -279,6 +282,22 @@ def init():
         c.execute("ALTER TABLE customers ADD COLUMN balance REAL DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # column already exists
+
+    # ---- owner->customer notification outbox ----
+    # The owner bot can't DM a customer (separate token), so owner-side actions
+    # (time change / block / unblock / broadcast) enqueue here and the CUSTOMER
+    # bot delivers them through its own chat with the user.
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notifications (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER,
+            text        TEXT,
+            sent        INTEGER DEFAULT 0,
+            created_at  TEXT
+        )
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -1426,5 +1445,38 @@ def set_forced_channel_enabled(channel_id: int, enabled: bool):
     conn = _conn()
     conn.execute("UPDATE forced_channels SET enabled = ? WHERE id = ?",
                  (1 if enabled else 0, int(channel_id)))
+    conn.commit()
+    conn.close()
+
+
+
+# =========================================================================== #
+# Owner -> customer notification outbox (delivered by the customer bot).
+# =========================================================================== #
+def enqueue_notification(customer_id: int, text: str):
+    """Queue a message for a customer. The owner bot calls this; the customer
+    bot's notification loop delivers it (the owner bot itself can't DM the user)."""
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO notifications (customer_id, text, sent, created_at) "
+        "VALUES (?, ?, 0, ?)",
+        (int(customer_id), str(text), config.now_str()))
+    conn.commit()
+    conn.close()
+
+
+def fetch_unsent_notifications(limit: int = 50):
+    """Return up to `limit` undelivered notifications (oldest first)."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT id, customer_id, text FROM notifications "
+        "WHERE sent = 0 ORDER BY id ASC LIMIT ?", (int(limit),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def mark_notification_sent(notif_id: int):
+    conn = _conn()
+    conn.execute("UPDATE notifications SET sent = 1 WHERE id = ?", (int(notif_id),))
     conn.commit()
     conn.close()

@@ -312,7 +312,25 @@ WORKER_SECRET = os.getenv("WORKER_SECRET", "").strip()
 
 GIT_REPO_URL = os.getenv("GIT_REPO_URL",
                          "https://github.com/willbedoneuw/Goao_iwo9").strip()
-GIT_BRANCH = os.getenv("GIT_BRANCH", "main").strip()
+def _detect_git_branch() -> str:
+    """Default worker branch = the branch the MASTER is actually running, so
+    provisioned workers clone the SAME code (env GIT_BRANCH still overrides).
+    Falls back to 'main' if git/.git isn't available (e.g. a stripped image)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5)
+        branch = (out.stdout or "").strip()
+        if out.returncode == 0 and branch and branch != "HEAD":
+            return branch
+    except Exception:
+        pass
+    return "main"
+
+
+GIT_BRANCH = os.getenv("GIT_BRANCH", "").strip() or _detect_git_branch()
 
 WORKER_API_PORT = _int("WORKER_API_PORT", 8765)
 WORKER_BIND_HOST = os.getenv("WORKER_BIND_HOST", "0.0.0.0").strip()

@@ -15,12 +15,12 @@ Only the configured OWNER may use it. It manages the whole service:
   * maintenance mode toggle + on-demand system backup
 
 The owner panel is the admin: it reads/writes BOTH the operational customer DB
-(db.py) and the owner-only central DB (central_db.py). Broadcasts are delivered
-THROUGH the customer bot's chats — the owner bot can message a customer because
-Telegram lets a bot DM any user who has started it; here we DM via this panel
-bot, and customers are also notified inside their own customer-bot chat by the
-customer bot's own loops. Privileged actions are logged to the central group
-and the audit log.
+(db.py) and the owner-only central DB (central_db.py). A bot can only DM users
+who started IT, and customers start the CUSTOMER bot — not this one. So owner
+actions that must reach a customer (time change / block / unblock / broadcast)
+are written to the db.notifications outbox and delivered by the customer bot's
+notification loop. Privileged actions are logged to the central group and the
+audit log.
 """
 import asyncio
 import os
@@ -247,7 +247,7 @@ async def addtime_cb(event):
     await logbus.to_group(card("🕒 تغییر زمان اشتراک", [
         f"🆔 {uid}", f"{days:+d} روز", f"📅 انقضا : {new_exp}", f"🕒 {now()}"]))
     try:
-        await bot.send_message(uid,
+        db.enqueue_notification(uid,
             (f"🎁 {days} روز به اشتراکت اضافه شد." if days >= 0
              else f"⏬ {abs(days)} روز از اشتراکت کم شد.") +
             f"\n📅 انقضا: {new_exp}")
@@ -276,7 +276,7 @@ async def block_cb(event):
     central_db.audit("block", str(uid))
     await logbus.to_group(card("⛔ مسدودسازی فوری", [f"🆔 {uid}", f"🕒 {now()}"]))
     try:
-        await bot.send_message(uid, "⛔ حساب شما توسط مدیریت مسدود شد.")
+        db.enqueue_notification(uid, "⛔ حساب شما توسط مدیریت مسدود شد.")
     except Exception:
         pass
     await _refresh_profile(event, uid)
@@ -292,7 +292,7 @@ async def unblock_cb(event):
     central_db.audit("unblock", str(uid))
     await logbus.to_group(card("✅ رفع مسدودی", [f"🆔 {uid}", f"🕒 {now()}"]))
     try:
-        await bot.send_message(uid, "✅ مسدودی حساب شما برداشته شد.")
+        db.enqueue_notification(uid, "✅ مسدودی حساب شما برداشته شد.")
     except Exception:
         pass
     await _refresh_profile(event, uid)
@@ -390,16 +390,16 @@ async def do_broadcast(event, text):
     fail = 0
     for c in customers:
         try:
-            await bot.send_message(c["telegram_id"], f"📣 {text}")
+            db.enqueue_notification(c["telegram_id"], f"📣 {text}")
             ok += 1
         except Exception:
             fail += 1
-        await asyncio.sleep(0.05)
     central_db.record_broadcast(text, ok, fail)
     central_db.audit("broadcast", f"ok={ok} fail={fail}")
     await logbus.to_group(card("📣 BROADCAST", [
         f"✅ {ok}   ❌ {fail}   👥 {len(customers)}", f"🕒 {now()}"]))
-    await event.respond(f"📣 ارسال شد. ✅ {ok} / ❌ {fail}", buttons=main_menu())
+    await event.respond(f"📣 در صفِ ارسال قرار گرفت. ✅ {ok} / ❌ {fail}",
+                        buttons=main_menu())
 
 
 # --------------------------------------------------------------------------- #
@@ -1095,7 +1095,7 @@ async def _handle_custtime(event, st):
     await logbus.to_group(card("🕒 تغییر زمان اشتراک", [
         f"🆔 {uid}", f"{days:+d} روز", f"📅 {new_exp}", f"🕒 {now()}"]))
     try:
-        await bot.send_message(uid, f"📅 زمان اشتراکت به‌روزرسانی شد. انقضا: {new_exp}")
+        db.enqueue_notification(uid, f"📅 زمان اشتراکت به‌روزرسانی شد. انقضا: {new_exp}")
     except Exception:
         pass
     c = db.get_customer(uid)

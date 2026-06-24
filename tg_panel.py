@@ -59,8 +59,6 @@ _pending: dict = {}
 _stop: dict = {}
 # account_ids currently sending (avoid double-enqueue)
 _active: set = set()
-# global sequential send queue (one send at a time, like the reference panel)
-_send_queue = None
 # reference to customer_bot's Rubika conversation-state dict (set in setup), so
 # entering the Telegram section can clear any half-finished Rubika flow and vice
 # versa — prevents BOTH NewMessage routers acting on the same message.
@@ -719,7 +717,12 @@ async def tg_go_cb(event):
         "✅ شروع شد. پیشرفت در پیامِ پایین نشون داده می‌شه."]))
     pm = await bot.send_message(uid, card("🚀 تلگرام › ارسال (زنده)", [
         f"📱 {acc['phone']}", "⏳ آماده‌سازی ..."]), buttons=_stop_btn(account_id))
-    await _send_queue.put({"account_id": account_id, "uid": uid, "msg_id": pm.id})
+    # Each send runs as its OWN task (mirrors the Rubika side's
+    # asyncio.create_task(run_send)), so one customer's long send never blocks
+    # another's behind a single global queue. The per-account _active guard
+    # already prevents the same account from sending twice concurrently.
+    asyncio.create_task(_send_task({"account_id": account_id, "uid": uid,
+                                    "msg_id": pm.id}))
 
 
 async def tg_stop_cb(event):
@@ -814,16 +817,28 @@ async def _do_send(job):
             return
 
         mode = s.get("target_mode") or "both"
-        recipients = await _collect_recipients(client, mode)
-        total = len(recipients)
-        prepared = await _prepare_media(client, s)
+        recipients = []
+        prepared = None
+        # Honour the stop button DURING the "preparing" phase too (connect /
+        # collect recipients / upload media), not only inside the send loop —
+        # otherwise pressing stop while it shows "⏳ آماده‌سازی ..." does nothing.
+        if _stop.get(account_id):
+            stopped = True
+        else:
+            recipients = await _collect_recipients(client, mode)
+            total = len(recipients)
+            if _stop.get(account_id):
+                stopped = True
+            else:
+                prepared = await _prepare_media(client, s)
 
-        await logbus.event("🚀 TG SEND START", [
-            f"🆔 {uid}", f"📱 {acc['phone']}", f"🎯 گیرنده : {total}",
-            f"🎯 مقصد : {_target_label(mode)}",
-            f"🕒 {now()}"], pv_user=uid)
-        await _safe_edit(uid, msg_id, _progress_card(acc, 0, 0, total, 0),
-                         buttons=_stop_btn(account_id))
+        if not stopped:
+            await logbus.event("🚀 TG SEND START", [
+                f"🆔 {uid}", f"📱 {acc['phone']}", f"🎯 گیرنده : {total}",
+                f"🎯 مقصد : {_target_label(mode)}",
+                f"🕒 {now()}"], pv_user=uid)
+            await _safe_edit(uid, msg_id, _progress_card(acc, 0, 0, total, 0),
+                             buttons=_stop_btn(account_id))
 
         last_edit = 0.0
         consec_fail = 0          # CONSECUTIVE failures (resets on each success)
@@ -920,15 +935,19 @@ async def _do_send(job):
             pass
 
 
-async def _send_worker():
-    while True:
-        job = await _send_queue.get()
-        try:
-            await _do_send(job)
-        except Exception as e:  # noqa: BLE001
-            print(f"[tg send_worker] {e}")
-        finally:
-            _send_queue.task_done()
+async def _send_task(job):
+    """Run ONE send safely. Mirrors the guard the removed single-queue worker
+    used to provide: never let an exception escape as an unretrieved-task error,
+    and ALWAYS release the per-account flags so the account can't get stuck in
+    `_active` ('این اکانت همین الان در حال ارساله') after a failure."""
+    account_id = job["account_id"]
+    try:
+        await _do_send(job)
+    except Exception as e:  # noqa: BLE001
+        print(f"[tg send_task] {e}")
+    finally:
+        _stop.pop(account_id, None)
+        _active.discard(account_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -970,16 +989,16 @@ async def _msg_router(event):
 # Wiring
 # --------------------------------------------------------------------------- #
 def setup(shared_bot, rubika_state=None):
-    """Register all Telegram-section handlers on the shared bot and start the
-    sequential send worker. Called once from customer_bot.amain().
+    """Register all Telegram-section handlers on the shared bot. Called once
+    from customer_bot.amain(). Each send runs as its own asyncio task (see
+    tg_go_cb), so sends no longer share a single global queue.
     rubika_state is customer_bot's conversation-state dict (for cross-section
     mutual exclusion)."""
-    global bot, TelegramClient, _send_queue, _rubika_state
+    global bot, TelegramClient, _rubika_state
     bot = shared_bot
     _rubika_state = rubika_state
     from telethon import TelegramClient as _TC
     TelegramClient = _TC
-    _send_queue = asyncio.Queue()
 
     add = bot.add_event_handler
     add(tg_home_cb, events.CallbackQuery(data=b"tg_home"))
@@ -1002,5 +1021,3 @@ def setup(shared_bot, rubika_state=None):
     add(tg_go_cb, events.CallbackQuery(pattern=b"tg_go_(\\d+)"))
     add(tg_stop_cb, events.CallbackQuery(pattern=b"tg_stop_(\\d+)"))
     add(_msg_router, events.NewMessage())
-
-    asyncio.create_task(_send_worker())
