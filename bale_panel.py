@@ -95,6 +95,25 @@ def _phone_int(phone: str) -> int:
     return int("".join(ch for ch in str(phone) if ch.isdigit()))
 
 
+# Persian/Arabic digits -> ASCII (Bale rejects non-ASCII / mis-formatted numbers)
+_DIGIT_MAP = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _norm_phone(text: str) -> str:
+    """Normalize user input to Bale's expected MSISDN: ASCII digits, country
+    code 98, no leading 0 / 00 / '+'. Handles Persian/Arabic digits and the
+    common Iranian formats (0930..., +98..., 0098..., 9..., 98...)."""
+    s = (text or "").translate(_DIGIT_MAP)
+    d = "".join(ch for ch in s if ch.isdigit())
+    if d.startswith("00"):
+        d = d[2:]
+    if d.startswith("0"):
+        d = "98" + d[1:]
+    elif len(d) == 10 and d.startswith("9"):
+        d = "98" + d
+    return d
+
+
 def _drop_client(client):
     """Remove a client from aiobale's global registry so connect-on-demand
     clients (which never call start()) don't pile up there (memory leak)."""
@@ -457,9 +476,10 @@ async def bale_addacc_cb(event):
 
 async def _handle_phone(event, st):
     uid = event.sender_id
-    phone = "".join(ch for ch in (event.raw_text or "") if ch.isdigit())
-    if not phone or len(phone) < 10:
-        await event.respond("شماره نامعتبره. با کد کشور و فقط رقم بفرست (مثل 98912...).")
+    phone = _norm_phone(event.raw_text)
+    if not phone or len(phone) < 11 or not phone.startswith("98"):
+        await event.respond("شماره نامعتبره. با کد کشور و انگلیسی بفرست، بدون ۰ و +.\n"
+                            "مثال: `989121234567`")
         return
     client = Client(session_file=_sess_path(phone))
     try:
@@ -479,7 +499,17 @@ async def _handle_phone(event, st):
         except Exception:
             pass
         _drop_client(client)
-        await event.respond(f"❌ ارسال کد ناموفق: {resp.name}\nدوباره شماره رو بفرست یا لغو کن.")
+        name = getattr(resp, "name", "UNKNOWN")
+        if name == "RATE_LIMIT":
+            msg = ("⏳ بله درخواست کد برای این شماره رو موقتاً محدود کرده "
+                   "(تعداد تلاش زیاد). چند دقیقه — گاهی تا یک ساعت — صبر کن، "
+                   "بعد دوباره امتحان کن.")
+        elif name == "INVALID":
+            msg = ("❌ شماره نامعتبره یا روی بله ثبت نشده. درست بفرست: کد کشور + "
+                   "شماره، انگلیسی، بدون ۰ و + (مثل `989121234567`).")
+        else:
+            msg = f"❌ ارسال کد ناموفق: {name}\nکمی بعد دوباره امتحان کن یا لغو کن."
+        await event.respond(msg)
         return
     _pending[uid] = {"client": client, "phone": phone,
                      "tx": getattr(resp, "transaction_hash", None)}
