@@ -140,7 +140,7 @@ async def build_buy_menu():
     return rows
 
 
-async def _gate(event, *, need_active: bool = True) -> bool:
+async def _gate(event, *, need_active: bool = True, count_action: bool = True) -> bool:
     """Common entry guard for every customer action. Returns True if the action
     may proceed. Handles maintenance, rate-limit/auto-block, and (optionally)
     subscription validity."""
@@ -158,11 +158,15 @@ async def _gate(event, *, need_active: bool = True) -> bool:
         await _respond(event, "🛠 ربات در حال تعمیر است. کمی بعد دوباره امتحان کن.")
         return False
 
-    # anti-flood: counts every action; auto-blocks on exceed
-    if not await ratelimit.guard(uid, name):
-        await _respond(event, "⛔ به‌خاطر فعالیت بیش از حد، حساب شما مسدود شد. "
-                              "برای رفع مسدودی با پشتیبانی در تماس باش.")
-        return False
+    # anti-flood: counts every COUNTED action; auto-blocks on exceed. Pure menu
+    # navigation (home/mainmenu/rubika_open) passes count_action=False so a user
+    # browsing menus can't auto-block themselves; blocked users are already
+    # rejected above, so skipping the count here is safe.
+    if count_action:
+        if not await ratelimit.guard(uid, name):
+            await _respond(event, "⛔ به‌خاطر فعالیت بیش از حد، حساب شما مسدود شد. "
+                                  "برای رفع مسدودی با پشتیبانی در تماس باش.")
+            return False
 
     if need_active:
         if config.FREE_MODE:
@@ -235,7 +239,7 @@ async def start_handler(event):
 
 @bot.on(events.CallbackQuery(data=b"mainmenu"))
 async def mainmenu_cb(event):
-    if not await _gate(event, need_active=False):
+    if not await _gate(event, need_active=False, count_action=False):
         return
     state.pop(event.sender_id, None)
     header = _sub_line(event.sender_id)
@@ -246,7 +250,7 @@ async def mainmenu_cb(event):
 
 @bot.on(events.CallbackQuery(data=b"rubika_open"))
 async def rubika_open_cb(event):
-    if not await _gate(event, need_active=False):
+    if not await _gate(event, need_active=False, count_action=False):
         return
     state.pop(event.sender_id, None)
     tg_panel._state.pop(event.sender_id, None)
@@ -257,7 +261,7 @@ async def rubika_open_cb(event):
 
 @bot.on(events.CallbackQuery(data=b"home"))
 async def home_cb(event):
-    if not await _gate(event, need_active=False):
+    if not await _gate(event, need_active=False, count_action=False):
         return
     state.pop(event.sender_id, None)
     tg_panel._state.pop(event.sender_id, None)
@@ -1257,6 +1261,12 @@ async def run_health_check(uid: int):
     rows = []
     for a in accounts:
         phone = a["phone"]
+        # don't open a 2nd connection to a session that's busy sending — a
+        # concurrent connection to the same Rubika session can invalidate it.
+        if a["id"] in active_jobs:
+            alive += 1
+            rows.append(f"• {phone} : 🟢 در حال ارسال")
+            continue
         w = worker.worker_for_account(a)
         try:
             if w and not worker.is_local(w):
@@ -1386,6 +1396,13 @@ async def send_prepare_cb(event):
     if aid in active_jobs:
         await event.answer("یک ارسال روی این اکانت در حال اجراست.", alert=True)
         return
+    # avoid using the same account's session from two paths at once (the send
+    # opens a raw client after account_conn.close, which would break an in-flight
+    # PV image-import on the same session and can invalidate the login).
+    if uid in pv_export_jobs:
+        await event.answer("ایمپورت تصویرت در حال اجراست؛ بعد از اتمامش ارسال رو شروع کن.",
+                           alert=True)
+        return
     marker = db.get_marker(uid)
     await _respond(event, f"⏳ پیدا کردن پیامِ نشان‌دار «{marker}» و آماده‌سازی لیست ...")
 
@@ -1479,9 +1496,13 @@ async def send_go_cb(event):
 
 @bot.on(events.CallbackQuery(pattern=b"sendstop_(\\d+)"))
 async def send_stop_cb(event):
-    if event.sender_id != event.sender_id:
-        return
+    uid = event.sender_id
     aid = int(event.pattern_match.group(1))
+    # only the OWNER of this account may stop its send (the previous check
+    # `event.sender_id != event.sender_id` was always False -> no check at all).
+    if not db.get_account_owned(aid, uid):
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
     stop_flags[aid] = True
     await event.answer("درخواست توقف ثبت شد.")
 
@@ -1838,6 +1859,12 @@ async def pvexport_run_cb(event):
         await event.answer("ایمپورت قبلی‌ات هنوز در حال اجراست. صبر کن تموم بشه.",
                            alert=True)
         return
+    # don't open the account's session for import while a send is using it
+    # (concurrent use of the same Rubika session can invalidate the login).
+    if aid in active_jobs:
+        await event.answer("این اکانت در حال ارساله؛ بعد از اتمام ارسال، ایمپورت رو بزن.",
+                           alert=True)
+        return
     if len(pv_export_jobs) >= config.PV_EXPORT_MAX_CONCURRENT:
         await event.answer("📸 ایمپورت تصویر الان در دسترس نیست — یه مشتری دیگه در "
                            "حال استفاده‌ست. چند دقیقه بعد دوباره امتحان کن.",
@@ -1846,7 +1873,8 @@ async def pvexport_run_cb(event):
     pv_export_jobs.add(uid)
     await _respond(event,
                    f"⏳ جمع‌آوری عکس‌های پیویِ {acc['phone']} ... ممکنه چند دقیقه طول بکشه.",
-                   buttons=[[Button.inline("🏠 منو", b"home")]])
+                   buttons=[[Button.inline("⛔ توقف و دریافت همینا", b"pvstop")],
+                            [Button.inline("🏠 منو", b"home")]])
     asyncio.create_task(run_pv_export(uid, acc))
 
 
@@ -2231,6 +2259,26 @@ async def expiry_loop():
 
 
 # --------------------------------------------------------------------------- #
+# Background loop: deliver owner->customer notifications.
+# The owner bot can't DM customers (separate token), so it enqueues messages in
+# db.notifications and THIS (customer) bot — which the customer has started —
+# delivers them. Best-effort, at-most-once.
+# --------------------------------------------------------------------------- #
+async def notification_loop():
+    while True:
+        try:
+            for n in db.fetch_unsent_notifications(50):
+                try:
+                    await bot.send_message(int(n["customer_id"]), n["text"])
+                except Exception:
+                    pass
+                db.mark_notification_sent(n["id"])
+        except Exception as e:  # noqa: BLE001
+            print(f"[notification loop] {e}")
+        await asyncio.sleep(10)
+
+
+# --------------------------------------------------------------------------- #
 # Entrypoint.
 # --------------------------------------------------------------------------- #
 async def amain():
@@ -2247,6 +2295,7 @@ async def amain():
     await logbus.to_group(card("🤖 CUSTOMER BOT ONLINE", [
         f"🏷 Version : {config.VERSION}", f"🕒 {now()}"]))
     asyncio.create_task(expiry_loop())
+    asyncio.create_task(notification_loop())
     print("customer bot running")
     await bot.run_until_disconnected()
 

@@ -28,8 +28,11 @@ def _now() -> str:
 
 def _conn():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # timeout + busy_timeout: wait for a held write lock instead of instantly
+    # raising "database is locked" under concurrent access.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
