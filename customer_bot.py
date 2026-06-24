@@ -1620,6 +1620,7 @@ async def run_send(payload: dict):
                         except Exception:
                             pass
                 except Exception as e:  # noqa: BLE001
+                    err_txt = repr(e)[:200]
                     # An auth-looking error is NOT proof the session is dead — a
                     # transient hiccup / brief AUTH_FROM_ANOTHER looks the same.
                     # CONFIRM on a fresh connection before declaring it dead, so a
@@ -1638,6 +1639,15 @@ async def run_send(payload: dict):
                         if really_dead:
                             reason = "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن"
                             db.set_status(account_id, "inactive")
+                            try:
+                                await logbus.to_group(card(
+                                    "🔎 AUTH-ERROR (سشن مرده اعلام شد)", [
+                                        f"📱 {phone}", f"🆔 {uid}",
+                                        f"💥 {err_txt}",
+                                        "verify_session_dead=True (اتصال تازه هم auth-error داد)",
+                                        f"🕒 {now()}"]))
+                            except Exception:
+                                pass
                             break
                         # confirmed ALIVE -> it was transient; reopen and continue
                         try:
@@ -1652,6 +1662,7 @@ async def run_send(payload: dict):
                         await logbus.to_group(card("❌ SEND ERROR", [
                             f"📱 اکانت : {phone}",
                             f"🆔 مشتری : {uid}",
+                            f"💥 {err_txt}",
                             f"🕒 {now()}"]))
                     except Exception:
                         pass
