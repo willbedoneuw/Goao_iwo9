@@ -51,6 +51,7 @@ AuthErrors = ChatType = PeerType = GroupType = None
 FileInput = None
 LoadDialogs = GetContacts = None
 SendMessage = MessageContent = TextMessage = None
+SendType = DocumentMessage = MessageCaption = DocumentsExt = PhotoExt = None
 _generate_id = None
 _add_header = _clean_grpc = None
 _BALE_CLIENTS = None   # ref to aiobale's global client registry (to avoid leaks)
@@ -976,24 +977,31 @@ async def _send_one(client, r, s):
     text = s.get("content_text") or ""
     ct = s.get("content_type")
     path = s.get("media_path")
-    if ct == "photo" and path:
-        await client.send_photo(FileInput(path), chat_id=cid, chat_type=ctype,
-                                caption=text or None)
-    elif ct == "file" and path:
-        await client.send_document(FileInput(path), chat_id=cid, chat_type=ctype,
-                                   caption=text or None)
+    chat = client._build_chat(cid, ctype)
+    peer = client._resolve_peer(chat)
+    if ct in ("photo", "file") and path:
+        # PHOTO/FILE: upload the file (this path works connection-less), then
+        # build the DocumentMessage exactly like aiobale's _send_file_message
+        # does and send it via the SAME raw path used for text/reads — which
+        # bypasses aiobale's response parser that crashes without a started
+        # client. Proven working end-to-end.
+        is_photo = ct == "photo"
+        send_type = SendType.PHOTO if is_photo else SendType.DOCUMENT
+        fi = await client.upload_file(file=FileInput(path), chat_id=cid,
+                                      chat_type=ctype, send_type=send_type)
+        caption = MessageCaption(content=text) if text else None
+        ext = DocumentsExt(photo=PhotoExt(w=1000, h=1000)) if is_photo else None
+        document = DocumentMessage(
+            file_id=fi.file_id, size=fi.size, name=fi.name,
+            mime_type=fi.mime_type, access_hash=fi.access_hash,
+            caption=caption, thumb=None, ext=ext)
+        content = MessageContent(document=document)
     else:
-        # TEXT: the high-level client.send_message crashes when parsing the
-        # response on the connection-less HTTP path (aiobale's response model
-        # needs a started client's validation context). So send via the SAME
-        # raw path the readers use (_raw_request), which never touches that
-        # parser. Proven working end-to-end.
-        chat = client._build_chat(cid, ctype)
-        peer = client._resolve_peer(chat)
-        call = SendMessage(peer=peer, message_id=_generate_id(),
-                           content=MessageContent(text=TextMessage(value=text)),
-                           chat=chat)
-        await _raw_request(client, call)
+        # TEXT
+        content = MessageContent(text=TextMessage(value=text))
+    call = SendMessage(peer=peer, message_id=_generate_id(),
+                       content=content, chat=chat)
+    await _raw_request(client, call)
 
 
 async def _run_send(uid, acc, msg_id):
@@ -1169,6 +1177,7 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
     global Client, AuthErrors, ChatType, PeerType, GroupType, FileInput
     global LoadDialogs, GetContacts, _add_header, _clean_grpc, _BALE_CLIENTS
     global SendMessage, MessageContent, TextMessage, _generate_id
+    global SendType, DocumentMessage, MessageCaption, DocumentsExt, PhotoExt
 
     bot = shared_bot
     _rubika_state = rubika_state
@@ -1177,9 +1186,12 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
     try:
         from aiobale import Client as _Client
         from aiobale.enums import (AuthErrors as _AE, ChatType as _CT,
-                                    PeerType as _PT, GroupType as _GT)
+                                    PeerType as _PT, GroupType as _GT,
+                                    SendType as _ST)
         from aiobale.types import (FileInput as _FI, MessageContent as _MC,
-                                    TextMessage as _TM)
+                                    TextMessage as _TM, DocumentMessage as _DM,
+                                    MessageCaption as _MCAP, DocumentsExt as _DE,
+                                    PhotoExt as _PE)
         from aiobale.methods import (LoadDialogs as _LD, GetContacts as _GC,
                                      SendMessage as _SM)
         from aiobale.utils import add_header as _AH, clean_grpc as _CG
@@ -1197,6 +1209,8 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
         _Client, _AE, _CT, _PT, _GT, _FI)
     LoadDialogs, GetContacts = _LD, _GC
     SendMessage, MessageContent, TextMessage, _generate_id = _SM, _MC, _TM, _GID
+    SendType, DocumentMessage, MessageCaption, DocumentsExt, PhotoExt = (
+        _ST, _DM, _MCAP, _DE, _PE)
     _add_header, _clean_grpc = _AH, _CG
     try:
         from aiobale.client.client import _CLIENTS as _BC
