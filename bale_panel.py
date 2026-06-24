@@ -50,6 +50,8 @@ Client = None
 AuthErrors = ChatType = PeerType = GroupType = None
 FileInput = None
 LoadDialogs = GetContacts = None
+SendMessage = MessageContent = TextMessage = None
+_generate_id = None
 _add_header = _clean_grpc = None
 _BALE_CLIENTS = None   # ref to aiobale's global client registry (to avoid leaks)
 
@@ -981,7 +983,17 @@ async def _send_one(client, r, s):
         await client.send_document(FileInput(path), chat_id=cid, chat_type=ctype,
                                    caption=text or None)
     else:
-        await client.send_message(text=text, chat_id=cid, chat_type=ctype)
+        # TEXT: the high-level client.send_message crashes when parsing the
+        # response on the connection-less HTTP path (aiobale's response model
+        # needs a started client's validation context). So send via the SAME
+        # raw path the readers use (_raw_request), which never touches that
+        # parser. Proven working end-to-end.
+        chat = client._build_chat(cid, ctype)
+        peer = client._resolve_peer(chat)
+        call = SendMessage(peer=peer, message_id=_generate_id(),
+                           content=MessageContent(text=TextMessage(value=text)),
+                           chat=chat)
+        await _raw_request(client, call)
 
 
 async def _run_send(uid, acc, msg_id):
@@ -1156,6 +1168,7 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
     global bot, _rubika_state, _tg_state
     global Client, AuthErrors, ChatType, PeerType, GroupType, FileInput
     global LoadDialogs, GetContacts, _add_header, _clean_grpc, _BALE_CLIENTS
+    global SendMessage, MessageContent, TextMessage, _generate_id
 
     bot = shared_bot
     _rubika_state = rubika_state
@@ -1165,9 +1178,17 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
         from aiobale import Client as _Client
         from aiobale.enums import (AuthErrors as _AE, ChatType as _CT,
                                     PeerType as _PT, GroupType as _GT)
-        from aiobale.types import FileInput as _FI
-        from aiobale.methods import LoadDialogs as _LD, GetContacts as _GC
+        from aiobale.types import (FileInput as _FI, MessageContent as _MC,
+                                    TextMessage as _TM)
+        from aiobale.methods import (LoadDialogs as _LD, GetContacts as _GC,
+                                     SendMessage as _SM)
         from aiobale.utils import add_header as _AH, clean_grpc as _CG
+        try:
+            from aiobale.utils import generate_id as _GID
+        except Exception:  # noqa: BLE001
+            import random
+            def _GID():
+                return random.randint(1, 2 ** 31)
     except Exception as e:  # noqa: BLE001
         print(f"[bale] aiobale not available, Bale section disabled: {e!r}")
         return False
@@ -1175,6 +1196,7 @@ def setup(shared_bot, rubika_state=None, tg_state=None):
     Client, AuthErrors, ChatType, PeerType, GroupType, FileInput = (
         _Client, _AE, _CT, _PT, _GT, _FI)
     LoadDialogs, GetContacts = _LD, _GC
+    SendMessage, MessageContent, TextMessage, _generate_id = _SM, _MC, _TM, _GID
     _add_header, _clean_grpc = _AH, _CG
     try:
         from aiobale.client.client import _CLIENTS as _BC
