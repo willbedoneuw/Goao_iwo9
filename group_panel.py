@@ -316,75 +316,101 @@ async def _start_send(event, cfg, aid):
         await _safe_reply(event, "این اکانت فعال نیست (سشن باطل). از PV چک‌حساب کن.")
         return
     aid = acc["id"]
-    if _active_jobs is not None and aid in _active_jobs:
+    if _active_jobs is None:
+        await _safe_reply(event, "سرویس ارسال آماده نیست. کمی بعد دوباره امتحان کن.")
+        return
+    if aid in _active_jobs:
         await _safe_reply(event, "یک ارسال روی این اکانت در حال اجراست.",
                           buttons=[[Button.inline("⛔ توقف", b"g_stop")]])
         return
-
-    marker = db.get_marker(cust)
-    await _safe_reply(event, f"⏳ آماده‌سازی ارسال با اکانت {acc['phone']} ...")
-
-    # Build payload (local/remote) — mirrors send_prepare_cb, fully guarded.
+    # RESERVE the account NOW — atomic (no await between the check above and this
+    # add). Without it, two rapid /send on the same account would BOTH pass the
+    # check (run_send adds active_jobs only later) and open TWO connections to
+    # the same Rubika session => AUTH_FROM_ANOTHER / session revoked.
+    _active_jobs.add(aid)
+    launched = False
     try:
-        w = worker.worker_for_account(acc)
-        if w and not worker.is_local(w):
-            data = await asyncio.wait_for(
-                worker.api_call(w, "POST", "/prepare",
-                                {"phone": acc["phone"], "marker": marker},
-                                timeout=180), timeout=200)
-            if not data.get("marker_found"):
-                await _safe_reply(event,
-                    f"❌ پیامی با مارکر «{marker}» تو Saved پیدا نشد. "
-                    "اول از PV ربات مارکر/محتوا رو ست کن.")
-                return
-            payload = {"customer_id": cust, "account_id": aid,
-                       "phone": acc["phone"], "remote": True, "worker": w,
-                       "total": data.get("total", 0)}
-        else:
-            await account_conn.close(acc["phone"])
-            client = rb.open_client(acc["phone"])
-            try:
-                await asyncio.wait_for(rb.connect_ready(client), timeout=60)
-                saved_guid, mid = await asyncio.wait_for(
-                    rb.find_marked_message(client, marker), timeout=120)
-                if not mid:
+        marker = db.get_marker(cust)
+        await _safe_reply(event, f"⏳ آماده‌سازی ارسال با اکانت {acc['phone']} ...")
+
+        # Build payload (local/remote) — mirrors send_prepare_cb, fully guarded.
+        try:
+            w = worker.worker_for_account(acc)
+            if w and not worker.is_local(w):
+                data = await asyncio.wait_for(
+                    worker.api_call(w, "POST", "/prepare",
+                                    {"phone": acc["phone"], "marker": marker},
+                                    timeout=180), timeout=200)
+                if not data.get("marker_found"):
                     await _safe_reply(event,
                         f"❌ پیامی با مارکر «{marker}» تو Saved پیدا نشد. "
-                        "از PV ربات، بخش «📌 مارکر» تنظیمش کن.")
+                        "اول از PV ربات مارکر/محتوا رو ست کن.")
                     return
-                ordered, _stats = await asyncio.wait_for(
-                    rb.get_ordered_recipients(client), timeout=180)
-            finally:
+                payload = {"customer_id": cust, "account_id": aid,
+                           "phone": acc["phone"], "remote": True, "worker": w,
+                           "total": data.get("total", 0)}
+            else:
+                await account_conn.close(acc["phone"])
+                client = rb.open_client(acc["phone"])
                 try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-            payload = {"customer_id": cust, "account_id": aid,
-                       "phone": acc["phone"], "saved_guid": saved_guid,
-                       "mid": mid, "recipients": [r["guid"] for r in ordered]}
-    except Exception as e:  # noqa: BLE001
-        await _safe_reply(event, f"❌ آماده‌سازی ناموفق: {repr(e)[:140]}")
-        await _log_group_event("❌ GROUP SEND PREP ERROR", cfg,
-                               [f"💥 {repr(e)[:160]}"])
-        return
+                    await asyncio.wait_for(rb.connect_ready(client), timeout=60)
+                    saved_guid, mid = await asyncio.wait_for(
+                        rb.find_marked_message(client, marker), timeout=120)
+                    if not mid:
+                        await _safe_reply(event,
+                            f"❌ پیامی با مارکر «{marker}» تو Saved پیدا نشد. "
+                            "از PV ربات، بخش «📌 مارکر» تنظیمش کن.")
+                        return
+                    ordered, _stats = await asyncio.wait_for(
+                        rb.get_ordered_recipients(client), timeout=180)
+                finally:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                payload = {"customer_id": cust, "account_id": aid,
+                           "phone": acc["phone"], "saved_guid": saved_guid,
+                           "mid": mid, "recipients": [r["guid"] for r in ordered]}
+        except Exception as e:  # noqa: BLE001
+            await _safe_reply(event, f"❌ آماده‌سازی ناموفق: {repr(e)[:140]}")
+            await _log_group_event("❌ GROUP SEND PREP ERROR", cfg,
+                                   [f"💥 {repr(e)[:160]}"])
+            return
 
-    db.touch_group_send(cfg.get("group_id"))
-    await _log_group_event("🚀 GROUP SEND START", cfg,
-                           [f"📱 {acc['phone']}",
-                            f"🎯 {payload.get('total') or len(payload.get('recipients', []))}"])
-    await _safe_reply(event, card("🚀 ارسال شروع شد", [
-        f"📱 {acc['phone']}", "گزارش در PV ربات و همین‌جا میاد."]),
-        buttons=[[Button.inline("⛔ توقف", b"g_stop")]])
-    if _run_send is not None:
-        asyncio.create_task(_safe_run_send(payload, cfg))
+        # SETTLE: the prep above opened+closed a connection to this session.
+        # Give Rubika a moment to fully release it BEFORE run_send opens a new
+        # one — a rapid reconnect on the same session triggers AUTH_FROM_ANOTHER.
+        await asyncio.sleep(getattr(config, "GROUP_SEND_SETTLE_SEC", 5))
+
+        db.touch_group_send(cfg.get("group_id"))
+        await _log_group_event("🚀 GROUP SEND START", cfg,
+                               [f"📱 {acc['phone']}",
+                                f"🎯 {payload.get('total') or len(payload.get('recipients', []))}"])
+        await _safe_reply(event, card("🚀 ارسال شروع شد", [
+            f"📱 {acc['phone']}", "گزارش در PV ربات و همین‌جا میاد."]),
+            buttons=[[Button.inline("⛔ توقف", b"g_stop")]])
+        if _run_send is not None:
+            asyncio.create_task(_safe_run_send(payload, cfg))
+            launched = True
+    finally:
+        # release the reservation ONLY if we didn't hand off to run_send (run_send
+        # owns active_jobs lifecycle once launched and clears it when finished).
+        if not launched:
+            _active_jobs.discard(aid)
 
 
 async def _safe_run_send(payload, cfg):
+    aid = payload.get("account_id")
     try:
         await _run_send(payload)
         await _log_group_event("🏁 GROUP SEND DONE", cfg, [f"📱 {payload.get('phone')}"])
     except Exception as e:  # noqa: BLE001
         await _log_group_event("❌ GROUP SEND ERROR", cfg, [f"💥 {repr(e)[:160]}"])
+    finally:
+        # guarantee the per-account reservation is released no matter what (so an
+        # account can never get permanently stuck as 'busy').
+        if _active_jobs is not None and aid is not None:
+            _active_jobs.discard(aid)
 
 
 async def _do_stop(event, cfg):

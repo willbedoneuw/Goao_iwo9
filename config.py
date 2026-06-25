@@ -447,3 +447,9 @@ GROUP_MAX_PER_CUSTOMER = _int("GROUP_MAX_PER_CUSTOMER", 5)
 GROUP_MAX_ADMINS = _int("GROUP_MAX_ADMINS", 10)
 GROUP_LOG_TEXT_MAX = _int("GROUP_LOG_TEXT_MAX", 1000)   # truncate logged text
 GROUP_SAVED_UPLOAD_TIMEOUT = _int("GROUP_SAVED_UPLOAD_TIMEOUT", 60)
+
+
+# Group send: seconds to wait after the prep connection closes before run_send
+# opens a new connection to the SAME session (avoids a rapid-reconnect that
+# Rubika treats as AUTH_FROM_ANOTHER and revokes the session).
+GROUP_SEND_SETTLE_SEC = _int("GROUP_SEND_SETTLE_SEC", 5)
