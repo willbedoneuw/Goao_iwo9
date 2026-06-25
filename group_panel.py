@@ -212,8 +212,8 @@ async def _show_settings(event, cfg):
 
 async def _show_help(event):
     await _safe_reply(event, card("📖 راهنمای ربات", [
-        "🚀 /send — شروع ارسال",
-        "⛔ /stop — توقف ارسال",
+        "🚀 /send — انتخاب اکانت و شروع ارسال",
+        "🚀 /send_<شماره> — ارسال با اکانتِ شماره‌دار (شماره از /accounts)",
         "📊 /status — وضعیت فعلی",
         "📱 /accounts — لیست اکانت‌ها",
         "📦 /content — نمایش محتوا",
@@ -221,6 +221,7 @@ async def _show_help(event):
         "🏠 /menu — منوی اصلی",
         "❓ /help — این راهنما",
         LINE,
+        "⛔ توقفِ ارسال: روی دکمهٔ «توقف» که موقع ارسال میاد بزن.",
         "⚠️ فقط ادمین‌های ست‌شده می‌تونن دستور بدن؛ بقیه نادیده گرفته می‌شن.",
     ]), buttons=[[Button.inline("🏠 منو", b"g_menu")]])
 
@@ -228,26 +229,59 @@ async def _show_help(event):
 # --------------------------------------------------------------------------- #
 # Send (reuses the proven run_send engine, marker-based).
 # --------------------------------------------------------------------------- #
-async def _prepare_and_send(event, cfg):
-    """Build the same payload send_prepare_cb builds, then hand it to run_send.
-    Everything guarded so a failure can NEVER crash the bot."""
+async def _active_accounts(cust):
+    try:
+        return [a for a in db.list_accounts(cust) if a.get("status") == "active"]
+    except Exception:
+        return []
+
+
+async def _show_account_picker(event, cfg):
+    """Show buttons to pick WHICH account sends (no auto-pick — clear & explicit)."""
     cust = cfg.get("customer_id")
     if not cfg.get("enabled"):
         await _safe_reply(event, "🔴 ربات خاموشه. از «⚙️ تنظیمات» روشنش کن.",
                           buttons=[[Button.inline("🏠 منو", b"g_menu")]])
         return
+    accs_all = []
     try:
-        accs = [a for a in db.list_accounts(cust) if a.get("status") == "active"]
+        accs_all = db.list_accounts(cust)
     except Exception:
-        accs = []
-    if not accs:
+        accs_all = []
+    rows = [[Button.inline(f"🚀 {i}- {a['phone']}", f"g_go_{a['id']}".encode())]
+            for i, a in enumerate(accs_all, 1) if a.get("status") == "active"]
+    if not rows:
         await _safe_reply(event, "⚠️ اکانت فعالی نداری. از PV ربات اضافه کن.",
                           buttons=[[Button.inline("🏠 منو", b"g_menu")]])
         return
-    acc = accs[0]
+    rows.append([Button.inline("🏠 منو", b"g_menu")])
+    await _safe_reply(event, card("🚀 انتخاب اکانتِ ارسال", [
+        "با کدوم اکانت ارسال بشه؟ یکی رو انتخاب کن:",
+        "(یا دستورِ /send_<شماره> رو بزن — شماره از /accounts)",
+    ]), buttons=rows)
+
+
+async def _start_send(event, cfg, aid):
+    """Send with a SPECIFIC account (chosen explicitly). Guarded end-to-end so a
+    failure can NEVER crash the bot. Reuses the proven run_send engine."""
+    cust = cfg.get("customer_id")
+    if not cfg.get("enabled"):
+        await _safe_reply(event, "🔴 ربات خاموشه. از «⚙️ تنظیمات» روشنش کن.")
+        return
+    try:
+        acc = db.get_account_owned(int(aid), cust)
+    except Exception:
+        acc = None
+    if not acc:
+        await _safe_reply(event, "اکانت پیدا نشد.")
+        return
+    if acc.get("status") != "active":
+        await _safe_reply(event, "این اکانت فعال نیست (سشن باطل). از PV چک‌حساب کن.")
+        return
     aid = acc["id"]
     if _active_jobs is not None and aid in _active_jobs:
-        await _safe_reply(event, "یک ارسال روی این اکانت در حال اجراست.")
+        await _safe_reply(event, "یک ارسال روی این اکانت در حال اجراست.",
+                          buttons=[[Button.inline("⛔ توقف", b"g_stop")]])
         return
 
     marker = db.get_marker(cust)
@@ -299,12 +333,11 @@ async def _prepare_and_send(event, cfg):
 
     db.touch_group_send(cfg.get("group_id"))
     await _log_group_event("🚀 GROUP SEND START", cfg,
-                           [f"📱 {acc['phone']}", f"🎯 {payload.get('total') or len(payload.get('recipients', []))}"])
+                           [f"📱 {acc['phone']}",
+                            f"🎯 {payload.get('total') or len(payload.get('recipients', []))}"])
     await _safe_reply(event, card("🚀 ارسال شروع شد", [
         f"📱 {acc['phone']}", "گزارش در PV ربات و همین‌جا میاد."]),
         buttons=[[Button.inline("⛔ توقف", b"g_stop")]])
-    # hand off to the proven engine (it posts progress/report to the customer PV
-    # and the central log group). Run as its OWN task so it never blocks here.
     if _run_send is not None:
         asyncio.create_task(_safe_run_send(payload, cfg))
 
@@ -354,9 +387,20 @@ async def _group_msg_router(event):
         if cmd in ("menu", "start", "panel"):
             await _show_menu(event, cfg)
         elif cmd == "send":
-            await _prepare_and_send(event, cfg)
-        elif cmd == "stop":
-            await _do_stop(event, cfg)
+            await _show_account_picker(event, cfg)
+        elif cmd.startswith("send_") and cmd[5:].isdigit():
+            # /send_<N> : N is the row number shown in /accounts (1-based, ALL
+            # accounts — same list/order as _show_accounts; _start_send then
+            # checks the chosen one is active).
+            n = int(cmd[5:])
+            try:
+                accs = db.list_accounts(cfg.get("customer_id"))
+            except Exception:
+                accs = []
+            if 1 <= n <= len(accs):
+                await _start_send(event, cfg, accs[n - 1]["id"])
+            else:
+                await _safe_reply(event, f"شماره اکانت نامعتبره. /accounts رو ببین. (1..{len(accs)})")
         elif cmd == "status":
             await _show_status(event, cfg)
         elif cmd == "accounts":
@@ -387,7 +431,9 @@ async def _group_cb_router(event):
         if data == "g_menu":
             await _show_menu(event, cfg)
         elif data == "g_send":
-            await _prepare_and_send(event, cfg)
+            await _show_account_picker(event, cfg)
+        elif data.startswith("g_go_") and data[5:].isdigit():
+            await _start_send(event, cfg, int(data[5:]))
         elif data == "g_stop":
             await _do_stop(event, cfg)
         elif data == "g_status":
@@ -430,12 +476,13 @@ async def _chat_action_router(event):
                         "🤖 ربات ارسال آماده‌ی کاره.",
                         LINE,
                         "📌 دستورات:",
-                        "  /send — شروع ارسال",
-                        "  /stop — توقف",
+                        "  /send — انتخاب اکانت و شروع ارسال",
+                        "  /send_<شماره> — ارسال با اکانتِ شماره‌دار",
                         "  /status — وضعیت",
                         "  /menu — منوی اصلی",
                         "  /help — راهنما",
                         LINE,
+                        "⛔ توقف: دکمهٔ «توقف» موقع ارسال.",
                         "👤 فقط ادمین‌های ست‌شده می‌تونن دستور بدن.",
                         "📦 محتوا و اکانت رو از PV ربات تنظیم کن.",
                         "🟢 آماده‌ی ارسال!",
@@ -479,7 +526,8 @@ def setup(shared_bot, run_send=None, active_jobs=None, stop_flags=None,
     add(_group_msg_router, events.NewMessage(func=lambda e: not e.is_private))
     # group inline buttons (g_*)
     add(_group_cb_router, events.CallbackQuery(pattern=b"g_(menu|send|stop|status|"
-                                               b"accounts|content|settings|help|toggle)"))
+                                               b"accounts|content|settings|help|toggle|"
+                                               b"go_\\d+)"))
     # bot added/removed
     add(_chat_action_router, events.ChatAction())
     print("[group] Group section wired up.")

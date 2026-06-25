@@ -2394,10 +2394,50 @@ async def gconf_group_cb(event):
     ]), buttons=[
         [Button.inline("👤 ادمین‌ها", f"gconf_admins_{gid}".encode()),
          Button.inline("📦 محتوا", f"gconf_content_{gid}".encode())],
+        [Button.inline("🔍 بررسی نصب", f"gconf_verify_{gid}".encode())],
         [Button.inline("🔴 خاموش" if cfg.get("enabled") else "🟢 روشن",
                        f"gconf_toggle_{gid}".encode()),
          Button.inline("🗑 حذف", f"gconf_del_{gid}".encode())],
         [Button.inline("🔙 تنظیمات گروه", b"gconf")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"gconf_verify_(-?\\d+)"))
+async def gconf_verify_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    gid = int(event.pattern_match.group(1).decode())
+    cfg = db.get_group_config(gid)
+    if not cfg or cfg.get("customer_id") != uid:
+        await event.answer("گروه پیدا نشد.", alert=True)
+        return
+    await _respond(event, "🔍 در حال بررسیِ عضویت و ادمین‌بودنِ ربات در گروه ...")
+    in_group = is_admin = False
+    err = ""
+    try:
+        me = await bot.get_me()
+        perms = await asyncio.wait_for(bot.get_permissions(gid, me.id), timeout=25)
+        in_group = True
+        is_admin = bool(getattr(perms, "is_admin", False))
+    except Exception as e:  # noqa: BLE001
+        in_group = False
+        err = repr(e)[:120]
+    db.set_group_installed(gid, in_group and is_admin)
+    if in_group and is_admin:
+        body = ["✅ ربات در گروه هست و ادمینه. آماده‌ی کاره!"]
+    elif in_group:
+        body = ["⚠️ ربات در گروه هست ولی ادمین نیست.",
+                "برای فرستادن پیام و جواب‌دادن به دستورات، ربات رو ادمینِ گروه کن."]
+    else:
+        body = ["❌ ربات در این گروه نیست (یا آیدی اشتباهه).",
+                "اول ربات رو به گروه اضافه و ادمین کن، بعد دوباره «بررسی نصب» رو بزن.",
+                (f"جزئیات: {err}" if err else "")]
+    await _respond(event, card("🔍 بررسی نصب", [f"💬 گروه : {gid}"] + body),
+                   buttons=[[Button.inline("🔁 بررسی دوباره", f"gconf_verify_{gid}".encode())],
+                            [Button.inline("🔙 گروه", f"gconf_g_{gid}".encode())]])
+    await logbus.event("🔍 GROUP VERIFY", [
+        f"🆔 {uid}", f"💬 گروه : {gid}",
+        f"عضو: {in_group} | ادمین: {is_admin}", f"🕒 {now()}"], pv_user=uid)
 
 
 @bot.on(events.CallbackQuery(pattern=b"gconf_admins_(-?\\d+)"))
