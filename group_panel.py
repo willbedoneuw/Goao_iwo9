@@ -39,6 +39,7 @@ _active_jobs = None       # customer_bot.active_jobs set (per-account guard)
 _stop_flags = None        # customer_bot.stop_flags dict
 _pending_send = None      # customer_bot.pending_send dict
 _customer_active_account = None  # customer_bot.customer_active_account (per-customer guard)
+_remote_upload_prepare = None    # customer_bot._remote_upload_prepare (worker upload)
 
 # in-group Rubika login flow, keyed by (chat_id, admin_sender_id). Mirrors the
 # PV add-account flow (phone -> code -> optional 2FA) but writes the account
@@ -301,7 +302,125 @@ async def _show_account_picker(event, cfg):
     ]), buttons=rows)
 
 
-async def _start_send(event, cfg, aid):
+async def _build_marker_payload(event, cfg, acc, aid, cust, w):
+    """Marker prep (remote /prepare or local find_marked_message). Returns the
+    send payload, or None (after telling the user why)."""
+    marker = db.get_marker(cust)
+    if w and not worker.is_local(w):
+        data = await asyncio.wait_for(
+            worker.api_call(w, "POST", "/prepare",
+                            {"phone": acc["phone"], "marker": marker},
+                            timeout=180), timeout=200)
+        if not data.get("marker_found"):
+            await _safe_reply(event,
+                f"❌ پیامی با مارکر «{marker}» تو Saved پیدا نشد. "
+                "اول از PV ربات مارکر/محتوا رو ست کن.")
+            return None
+        return {"customer_id": cust, "account_id": aid, "phone": acc["phone"],
+                "remote": True, "worker": w, "total": data.get("total", 0)}
+    await account_conn.close(acc["phone"])
+    client = rb.open_client(acc["phone"])
+    try:
+        await asyncio.wait_for(rb.connect_ready(client), timeout=60)
+        saved_guid, mid = await asyncio.wait_for(
+            rb.find_marked_message(client, marker), timeout=120)
+        if not mid:
+            await _safe_reply(event,
+                f"❌ پیامی با مارکر «{marker}» تو Saved پیدا نشد. "
+                "از PV ربات، بخش «📌 مارکر» تنظیمش کن.")
+            return None
+        ordered, _stats = await asyncio.wait_for(
+            rb.get_ordered_recipients(client), timeout=180)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    return {"customer_id": cust, "account_id": aid, "phone": acc["phone"],
+            "saved_guid": saved_guid, "mid": mid,
+            "recipients": [r["guid"] for r in ordered]}
+
+
+async def _build_upload_payload(event, cfg, acc, aid, cust, w):
+    """Auto-upload prep using the customer's CONFIGURED file (set in PV). Uploads
+    it to the account's Saved (local or via the worker), then returns the send
+    payload, or None (after telling the user why / steering to the marker)."""
+    try:
+        up = db.get_upload_file(cust)
+    except Exception:
+        up = None
+    if not up:
+        await _safe_reply(event,
+            "📤 فایلی ثبت نشده. اول از PV ربات → «📌 مارکر» → "
+            "«تنظیم فایلِ آپلودِ خودکار» فایل رو ثبت کن.")
+        return None
+
+    # ----- REMOTE worker upload (reuses customer_bot._remote_upload_prepare) ---
+    if w and not worker.is_local(w):
+        if _remote_upload_prepare is None:
+            await _safe_reply(event,
+                "آپلودِ خودکار برای این اکانت آماده نیست — از «📌 مارکر» استفاده کن.")
+            return None
+        try:
+            return await _remote_upload_prepare(cust, aid, acc, w, up)
+        except Exception as e:  # noqa: BLE001
+            await _safe_reply(event,
+                f"❌ آپلودِ خودکار ناموفق: {repr(e)[:120]}\n👉 از «📌 مارکر» استفاده کن.")
+            return None
+
+    # ----- LOCAL upload -----
+    await account_conn.close(acc["phone"])
+    client = rb.open_client(acc["phone"])
+    try:
+        await asyncio.wait_for(rb.connect_ready(client), timeout=60)
+        try:
+            saved_guid, mid = await asyncio.wait_for(
+                rb.upload_file_to_self(client, up["path"], caption="",
+                                       file_name=up["name"]), timeout=300)
+        except Exception as e:  # noqa: BLE001
+            await _safe_reply(event,
+                f"❌ آپلودِ خودکار ناموفق: {repr(e)[:120]}\n👉 از «📌 مارکر» استفاده کن.")
+            return None
+        ordered, _stats = await asyncio.wait_for(
+            rb.get_ordered_recipients(client), timeout=180)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    return {"customer_id": cust, "account_id": aid, "phone": acc["phone"],
+            "saved_guid": saved_guid, "mid": mid,
+            "recipients": [r["guid"] for r in ordered]}
+
+
+async def _choose_send_mode(event, cfg, aid):
+    """After picking an account: ask marker-or-upload if a file is configured,
+    else go straight to the marker send."""
+    cust = cfg.get("customer_id")
+    try:
+        acc = db.get_account_owned(int(aid), cust)
+    except Exception:
+        acc = None
+    if not acc:
+        await _safe_reply(event, "اکانت پیدا نشد.")
+        return
+    try:
+        up = db.get_upload_file(cust)
+    except Exception:
+        up = None
+    if not up:
+        await _start_send(event, cfg, aid, mode="marker")
+        return
+    await _safe_reply(event, card("🚀 شیوه‌ی ارسال", [
+        f"📱 {acc['phone']}",
+        "📌 مارکر یا 📤 فایلِ ثبت‌شده؟",
+        f"📤 فایلِ ثبت‌شده : «{up['name']}»",
+    ]), buttons=[[Button.inline("📌 مارکر", f"g_mk_{aid}".encode())],
+                 [Button.inline(f"📤 آپلودِ «{up['name']}»", f"g_up_{aid}".encode())],
+                 [Button.inline("🏠 منو", b"g_menu")]])
+
+
+async def _start_send(event, cfg, aid, mode="marker"):
     """Send with a SPECIFIC account (chosen explicitly). Guarded end-to-end so a
     failure can NEVER crash the bot. Reuses the proven run_send engine."""
     cust = cfg.get("customer_id")
@@ -348,52 +467,20 @@ async def _start_send(event, cfg, aid):
     _active_jobs.add(aid)
     launched = False
     try:
-        marker = db.get_marker(cust)
         await _safe_reply(event, f"⏳ آماده‌سازی ارسال با اکانت {acc['phone']} ...")
-
-        # Build payload (local/remote) — mirrors send_prepare_cb, fully guarded.
+        w = worker.worker_for_account(acc)
         try:
-            w = worker.worker_for_account(acc)
-            if w and not worker.is_local(w):
-                data = await asyncio.wait_for(
-                    worker.api_call(w, "POST", "/prepare",
-                                    {"phone": acc["phone"], "marker": marker},
-                                    timeout=180), timeout=200)
-                if not data.get("marker_found"):
-                    await _safe_reply(event,
-                        f"❌ پیامی با مارکر «{marker}» تو Saved پیدا نشد. "
-                        "اول از PV ربات مارکر/محتوا رو ست کن.")
-                    return
-                payload = {"customer_id": cust, "account_id": aid,
-                           "phone": acc["phone"], "remote": True, "worker": w,
-                           "total": data.get("total", 0)}
+            if mode == "upload":
+                payload = await _build_upload_payload(event, cfg, acc, aid, cust, w)
             else:
-                await account_conn.close(acc["phone"])
-                client = rb.open_client(acc["phone"])
-                try:
-                    await asyncio.wait_for(rb.connect_ready(client), timeout=60)
-                    saved_guid, mid = await asyncio.wait_for(
-                        rb.find_marked_message(client, marker), timeout=120)
-                    if not mid:
-                        await _safe_reply(event,
-                            f"❌ پیامی با مارکر «{marker}» تو Saved پیدا نشد. "
-                            "از PV ربات، بخش «📌 مارکر» تنظیمش کن.")
-                        return
-                    ordered, _stats = await asyncio.wait_for(
-                        rb.get_ordered_recipients(client), timeout=180)
-                finally:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                payload = {"customer_id": cust, "account_id": aid,
-                           "phone": acc["phone"], "saved_guid": saved_guid,
-                           "mid": mid, "recipients": [r["guid"] for r in ordered]}
+                payload = await _build_marker_payload(event, cfg, acc, aid, cust, w)
         except Exception as e:  # noqa: BLE001
             await _safe_reply(event, f"❌ آماده‌سازی ناموفق: {repr(e)[:140]}")
             await _log_group_event("❌ GROUP SEND PREP ERROR", cfg,
                                    [f"💥 {repr(e)[:160]}"])
             return
+        if payload is None:
+            return  # the builder already told the user why
 
         # SETTLE: the prep above opened+closed a connection to this session.
         # Give Rubika a moment to fully release it BEFORE run_send opens a new
@@ -738,7 +825,7 @@ async def _group_msg_router(event):
                 accs = []
             acc = _resolve_account(accs, cmd[5:])
             if acc:
-                await _start_send(event, cfg, acc["id"])
+                await _choose_send_mode(event, cfg, acc["id"])
             else:
                 await _safe_reply(event,
                     "شماره یا شماره‌تلفنِ اکانت نامعتبره. /accounts رو ببین.")
@@ -786,7 +873,11 @@ async def _group_cb_router(event):
         elif data == "g_send":
             await _show_account_picker(event, cfg)
         elif data.startswith("g_go_") and data[5:].isdigit():
-            await _start_send(event, cfg, int(data[5:]))
+            await _choose_send_mode(event, cfg, int(data[5:]))
+        elif data.startswith("g_mk_") and data[5:].isdigit():
+            await _start_send(event, cfg, int(data[5:]), mode="marker")
+        elif data.startswith("g_up_") and data[5:].isdigit():
+            await _start_send(event, cfg, int(data[5:]), mode="upload")
         elif data == "g_stop":
             await _do_stop(event, cfg)
         elif data == "g_status":
@@ -859,12 +950,13 @@ async def _chat_action_router(event):
 # Wiring
 # --------------------------------------------------------------------------- #
 def setup(shared_bot, run_send=None, active_jobs=None, stop_flags=None,
-          pending_send=None, customer_active_account=None):
+          pending_send=None, customer_active_account=None,
+          remote_upload_prepare=None):
     """Register group handlers. Called once from customer_bot.amain().
     run_send/active_jobs/stop_flags/pending_send are customer_bot references
     (so we REUSE the proven send engine instead of duplicating it)."""
     global bot, _run_send, _active_jobs, _stop_flags, _pending_send
-    global _customer_active_account
+    global _customer_active_account, _remote_upload_prepare
     global rb, worker, account_conn
     bot = shared_bot
     _run_send = run_send
@@ -872,6 +964,7 @@ def setup(shared_bot, run_send=None, active_jobs=None, stop_flags=None,
     _stop_flags = stop_flags
     _pending_send = pending_send
     _customer_active_account = customer_active_account
+    _remote_upload_prepare = remote_upload_prepare
 
     import rubika_client as _rb
     import worker as _w
@@ -884,7 +977,7 @@ def setup(shared_bot, run_send=None, active_jobs=None, stop_flags=None,
     # group inline buttons (g_*)
     add(_group_cb_router, events.CallbackQuery(pattern=b"g_(menu|send|stop|status|"
                                                b"accounts|content|settings|help|toggle|"
-                                               b"login|go_\\d+)"))
+                                               b"login|go_\\d+|mk_\\d+|up_\\d+)"))
     # bot added/removed
     add(_chat_action_router, events.ChatAction())
     print("[group] Group section wired up.")

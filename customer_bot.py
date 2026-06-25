@@ -3055,7 +3055,8 @@ async def amain():
     bale_panel.setup(bot, state, tg_panel._state)   # decoupled Bale section
     group_panel.setup(bot, run_send=run_send, active_jobs=active_jobs,
                       stop_flags=stop_flags, pending_send=pending_send,
-                      customer_active_account=customer_active_account)
+                      customer_active_account=customer_active_account,
+                      remote_upload_prepare=_remote_upload_prepare)
     await logbus.to_group(card("🤖 CUSTOMER BOT ONLINE", [
         f"🏷 Version : {config.VERSION}", f"🕒 {now()}"]))
     asyncio.create_task(expiry_loop())
