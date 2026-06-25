@@ -213,7 +213,7 @@ async def _show_settings(event, cfg):
 async def _show_help(event):
     await _safe_reply(event, card("📖 راهنمای ربات", [
         "🚀 /send — انتخاب اکانت و شروع ارسال",
-        "🚀 /send_<شماره> — ارسال با اکانتِ شماره‌دار (شماره از /accounts)",
+        "🚀 /send_<شماره یا شماره‌تلفن> — ارسال با اون اکانت (از /accounts)",
         "📊 /status — وضعیت فعلی",
         "📱 /accounts — لیست اکانت‌ها",
         "📦 /content — نمایش محتوا",
@@ -229,6 +229,32 @@ async def _show_help(event):
 # --------------------------------------------------------------------------- #
 # Send (reuses the proven run_send engine, marker-based).
 # --------------------------------------------------------------------------- #
+_PD_MAP = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _digits(s) -> str:
+    return "".join(c for c in str(s or "").translate(_PD_MAP) if c.isdigit())
+
+
+def _resolve_account(accs, arg):
+    """Resolve /send_<arg> to an account. `arg` may be the row number shown in
+    /accounts (1-based) OR the account phone (any format: 0937..., 9890..., +98,
+    Persian digits — matched by the last 10 digits)."""
+    d = _digits(arg)
+    if not d:
+        return None
+    # short number -> row index (matches /accounts numbering)
+    if len(d) <= 4 and 1 <= int(d) <= len(accs):
+        return accs[int(d) - 1]
+    # otherwise treat as a phone: match by the last 10 digits
+    tail = d[-10:]
+    if len(tail) >= 7:
+        for a in accs:
+            if _digits(a.get("phone"))[-10:] == tail:
+                return a
+    return None
+
+
 async def _active_accounts(cust):
     try:
         return [a for a in db.list_accounts(cust) if a.get("status") == "active"]
@@ -411,19 +437,18 @@ async def _group_msg_router(event):
             await _show_menu(event, cfg)
         elif cmd == "send":
             await _show_account_picker(event, cfg)
-        elif cmd.startswith("send_") and cmd[5:].isdigit():
-            # /send_<N> : N is the row number shown in /accounts (1-based, ALL
-            # accounts — same list/order as _show_accounts; _start_send then
-            # checks the chosen one is active).
-            n = int(cmd[5:])
+        elif cmd.startswith("send_") and len(cmd) > 5:
+            # /send_<arg> : arg = row number (from /accounts) OR account phone
             try:
-                accs = db.list_accounts(cfg.get("customer_id"))
+                accs = db.list_accounts(cfg.get("customer_id")) or []
             except Exception:
                 accs = []
-            if 1 <= n <= len(accs):
-                await _start_send(event, cfg, accs[n - 1]["id"])
+            acc = _resolve_account(accs, cmd[5:])
+            if acc:
+                await _start_send(event, cfg, acc["id"])
             else:
-                await _safe_reply(event, f"شماره اکانت نامعتبره. /accounts رو ببین. (1..{len(accs)})")
+                await _safe_reply(event,
+                    "شماره یا شماره‌تلفنِ اکانت نامعتبره. /accounts رو ببین.")
         elif cmd == "status":
             await _show_status(event, cfg)
         elif cmd == "accounts":
