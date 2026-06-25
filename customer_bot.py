@@ -141,6 +141,45 @@ async def _post_progress(payload, ok, fail, total):
         pass
 
 
+def _final_report_card(payload, ok, fail, total, dur, reason=None, retry_count=0):
+    phone = payload.get("phone")
+    w = payload.get("worker") or {}
+    tag = (w.get("tag") or w.get("id")) if w else None
+    rows = [
+        f"✓ موفق: {ok} ({_pct(ok, total)}%)",
+        f"✗ ناموفق: {fail}",
+        f"📱 اکانت: {phone}" + (f" (ورکر #{tag})" if tag else ""),
+        f"🎯 کل: {total}",
+        f"⏱ مدت: {dur}",
+    ]
+    if retry_count:
+        rows.append(f"🔄 ادامه‌ی خودکار: {retry_count} بار")
+    if reason:
+        rows.append(f"⛔ دلیلِ توقف: {reason}")
+    rows.append(f"🕒 {now()}")
+    return card("▪️ گزارش ارسال", rows)
+
+
+async def _post_final_report(payload, ok, fail, total, dur, reason=None, retry_count=0):
+    """Final send report — posted whenever a send ends OR stops (any reason) to
+    the originating chat (group/PV) AND the central log group. Never raises."""
+    text = _final_report_card(payload, ok, fail, total, dur, reason, retry_count)
+    chat = payload.get("notify_chat")
+    if chat:
+        try:
+            await bot.send_message(chat, text, buttons=main_menu()
+                                   if chat == payload.get("customer_id") else None)
+        except Exception:
+            try:
+                await bot.send_message(chat, text)
+            except Exception:
+                pass
+    try:
+        await logbus.to_group(text)
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # Subscription / access helpers.
 # --------------------------------------------------------------------------- #
@@ -2092,17 +2131,16 @@ async def run_send(payload: dict):
         pending_send.pop(account_id, None)
 
     dur = str(datetime.now() - started).split(".")[0]
+    await _post_final_report(payload, ok, fail, total, dur, reason, retry_count)
     if reason:
         await logbus.event("⛔ SEND STOPPED", [
             f"🆔 {uid}", f"📱 {phone}",
             f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
-            f"⚠️ {reason}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
-        await _safe_send(uid, f"⛔ ارسال متوقف شد. ✅ {ok} / ❌ {fail} از {total}\nدلیل: {reason}")
+            f"⚠️ {reason}", f"⏱ {dur}", f"🕒 {now()}"])
     else:
         await logbus.event("✅ SEND FINISHED", [
             f"🆔 {uid}", f"📱 {phone}",
-            f"✅ {ok}   ❌ {fail}   📁 {total}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
-        await _safe_send(uid, f"✅ ارسال تمام شد. ✅ {ok} / ❌ {fail} از {total}")
+            f"✅ {ok}   ❌ {fail}   📁 {total}", f"⏱ {dur}", f"🕒 {now()}"])
 
 
 async def _safe_send(uid, text):
@@ -2258,17 +2296,16 @@ async def _run_send_remote(payload: dict):
             pass
 
     dur = str(datetime.now() - started).split(".")[0]
+    await _post_final_report(payload, ok, fail, total, dur, reason)
     if reason:
         await logbus.event("⛔ SEND STOPPED", [
             f"🆔 {uid}", f"📱 {phone}",
             f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
-            f"⚠️ {reason}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
-        await _safe_send(uid, f"⛔ ارسال متوقف شد. ✅ {ok} / ❌ {fail} از {total}\nدلیل: {reason}")
+            f"⚠️ {reason}", f"⏱ {dur}", f"🕒 {now()}"])
     else:
         await logbus.event("✅ SEND FINISHED", [
             f"🆔 {uid}", f"📱 {phone}",
-            f"✅ {ok}   ❌ {fail}   📁 {total}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
-        await _safe_send(uid, f"✅ ارسال تمام شد. ✅ {ok} / ❌ {fail} از {total}")
+            f"✅ {ok}   ❌ {fail}   📁 {total}", f"⏱ {dur}", f"🕒 {now()}"])
 
 
 # --------------------------------------------------------------------------- #

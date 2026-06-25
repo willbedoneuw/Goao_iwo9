@@ -20,7 +20,7 @@ Behaviour:
   * In a configured group, ONLY the configured admin_ids get answered; every
     other message is ignored (but still logged to the central group for the
     owner — group id + customer + sender + full text, truncated).
-  * Commands (and inline buttons): /menu /send /stop /status /accounts
+  * Commands (and inline buttons): /menu /send /login /status /accounts
     /content /settings /help.
   * Sending REUSES the proven run_send engine (marker-based for now).
 """
@@ -889,7 +889,7 @@ async def _group_msg_router(event):
         # block / maintenance / subscription gate (mirrors PV _gate) — a blocked
         # or unpaid customer can't act in their group. /help stays open so they
         # can still read how to reach support.
-        if cmd not in ("help", "stop"):
+        if cmd != "help":
             ok, gmsg = _gate_customer(cfg.get("customer_id"))
             if not ok:
                 await _safe_reply(event, gmsg)
@@ -914,8 +914,6 @@ async def _group_msg_router(event):
                     "شماره یا شماره‌تلفنِ اکانت نامعتبره. /accounts رو ببین.")
         elif cmd == "status":
             await _show_status(event, cfg)
-        elif cmd == "stop":
-            await _do_stop(event, cfg)
         elif cmd == "accounts":
             await _show_accounts(event, cfg)
         elif cmd in ("login", "addacc", "add"):
@@ -1009,11 +1007,11 @@ async def send_install_card(gid):
             "📌 دستورات:",
             "  /send — شروع ارسال",
             "  /login — افزودن اکانت روبیکا",
-            "  /stop — توقف",
             "  /status — وضعیت",
             "  /menu — منوی اصلی",
             "  /help — راهنما",
             LINE,
+            "⛔ توقفِ ارسال: دکمهٔ «توقف» که موقعِ ارسال میاد.",
             "👤 فقط ادمین‌های ست‌شده می‌تونن دستور بدن.",
             "📦 محتوا و اکانت رو از PV ربات تنظیم کن.",
             "🟢 آماده‌ی ارسال!",
