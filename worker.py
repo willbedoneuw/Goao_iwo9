@@ -274,19 +274,59 @@ async def restart_worker(worker: dict) -> tuple:
 
 
 async def update_worker(worker: dict) -> tuple:
-    """git pull + rebuild image + recreate container."""
+    """Force the worker checkout to config.GIT_BRANCH's latest, rebuild the
+    image, recreate the container. Robust to a worker stuck on the wrong branch
+    (uses fetch + checkout -B FETCH_HEAD) and surfaces a build failure as a
+    non-zero exit (so a silent old image isn't reported as success)."""
     conn = await _with_conn(worker)
     try:
+        br = config.GIT_BRANCH
         cmd = (
-            f"cd {REMOTE_DIR} && git pull && docker build --network=host -t {IMAGE} . && "
-            f"docker rm -f {CONTAINER} 2>/dev/null; "
-            f"docker run -d --name {CONTAINER} --restart always "
-            f"--network=host "
+            f"cd {REMOTE_DIR} && "
+            f"git fetch origin {br} && "
+            f"git checkout -B {br} FETCH_HEAD && "
+            f"docker build --network=host -t {IMAGE} . && "
+            f"(docker rm -f {CONTAINER} 2>/dev/null || true) && "
+            f"docker run -d --name {CONTAINER} --restart always --network=host "
             f"--env-file {REMOTE_DIR}/.env -v {REMOTE_DATA}:/app/data {IMAGE}"
         )
         return await _run(conn, cmd)
     finally:
         conn.close()
+
+
+def master_code_version() -> str:
+    """Short git commit of the MASTER's own checkout (what workers should match)."""
+    import os
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5)
+        return (out.stdout or "").strip() or "?"
+    except Exception:
+        return "?"
+
+
+async def worker_code_version(worker: dict) -> str:
+    """SSH into a remote worker and return its checkout's short commit (or '?')."""
+    if worker.get("is_master"):
+        return master_code_version()
+    conn = None
+    try:
+        conn = await _with_conn(worker)
+        _code, out, _err = await _run(
+            conn, f"cd {REMOTE_DIR} && git rev-parse --short HEAD 2>/dev/null")
+        return (out or "").strip() or "?"
+    except Exception:
+        return "?"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 async def teardown_worker(worker: dict):

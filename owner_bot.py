@@ -709,8 +709,74 @@ async def workers_cb(event):
         rows.append([Button.inline(label, f"w_{w['id']}".encode())])
     rows.append([Button.inline("➕ افزودن ورکر", b"w_add"),
                  Button.inline("🩺 بررسی همه", b"w_checkall")])
+    rows.append([Button.inline("⬆️ آپدیت همه", b"w_updall"),
+                 Button.inline("📦 نسخه‌ها", b"w_versions")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     await safe_edit(event, header, buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"w_versions"))
+async def w_versions_cb(event):
+    if not is_owner(event):
+        return
+    await event.answer("در حال خواندن نسخه‌ی هر ورکر ...")
+    master_v = worker.master_code_version()
+    workers = db.list_workers()
+    rows = [f"👑 مستر : `{master_v}`  (برنچ: {config.GIT_BRANCH})", LINE]
+    for w in workers:
+        if w.get("is_master"):
+            rows.append(f"👑 {w['tag']} : `{master_v}` ✅ (مستر)")
+            continue
+        v = await worker.worker_code_version(w)
+        if v == master_v and v != "?":
+            mark = "✅ آخرین"
+        elif v == "?":
+            mark = "❔ نامشخص (در دسترس نیست)"
+        else:
+            mark = "⚠️ قدیمی — آپدیت کن"
+        rows.append(f"🖥 {w['tag']} : `{v}`  {mark}")
+    await safe_edit(event, card("📦 نسخه‌ی کدِ ورکرها", rows),
+                    buttons=[[Button.inline("⬆️ آپدیت همه", b"w_updall")],
+                             [Button.inline("🔄 تازه‌سازی", b"w_versions"),
+                              Button.inline("🔙 بازگشت", b"workers")]])
+
+
+@bot.on(events.CallbackQuery(data=b"w_updall"))
+async def w_updall_cb(event):
+    if not is_owner(event):
+        return
+    workers = [w for w in db.list_workers() if not w.get("is_master")]
+    if not workers:
+        await event.answer("ورکرِ ریموتی برای آپدیت نیست.", alert=True)
+        return
+    await event.answer("شروعِ آپدیتِ همه‌ی ورکرها ... ممکنه چند دقیقه طول بکشه.")
+    target = worker.master_code_version()
+    pm = await bot.send_message(event.sender_id,
+                                f"⬆️ آپدیتِ {len(workers)} ورکر به نسخه‌ی `{target}` ...")
+    rows = []
+    for w in workers:
+        try:
+            code, out, err = await worker.update_worker(w)
+            ok = (code == 0)
+        except Exception as e:  # noqa: BLE001
+            ok, err = False, repr(e)[:160]
+        v = await worker.worker_code_version(w) if ok else "?"
+        if ok and v == target:
+            rows.append(f"✅ {w['tag']} → `{v}`")
+        elif ok:
+            rows.append(f"⚠️ {w['tag']} → `{v}` (هنوز برابرِ مستر نیست)")
+        else:
+            rows.append(f"❌ {w['tag']} : {str(err)[-120:]}")
+        try:
+            await bot.edit_message(event.sender_id, pm.id,
+                card("⬆️ آپدیتِ همه‌ی ورکرها", rows + [f"🕒 {now()}"]))
+        except Exception:
+            pass
+    await logbus.to_group(card("⬆️ WORKER UPDATE ALL", rows + [f"🎯 target `{target}`",
+                                                               f"🕒 {now()}"]))
+    await bot.send_message(event.sender_id, "تمام شد.",
+                           buttons=[[Button.inline("📦 نسخه‌ها", b"w_versions")],
+                                    [Button.inline("🔙 ورکرها", b"workers")]])
 
 
 @bot.on(events.CallbackQuery(data=b"w_checkall"))
