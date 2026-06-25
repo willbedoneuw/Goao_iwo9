@@ -1376,17 +1376,11 @@ async def _newest_saved_message_id(client: Client, saved_guid: str):
     ids = []
     for m in messages:
         mid = _msg_id_of(m)
-        if mid is not None:
-            try:
-                ids.append(int(mid))
-            except (TypeError, ValueError):
-                ids.append(mid)
-    if not ids:
-        return None
-    try:
-        return max(ids)
-    except TypeError:
-        return ids[0]
+        try:
+            ids.append(int(mid))
+        except (TypeError, ValueError):
+            continue  # keep only numeric ids so the result is always int|None
+    return max(ids) if ids else None
 
 
 async def upload_file_to_self(client: Client, file_path: str, caption: str = "",

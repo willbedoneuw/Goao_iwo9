@@ -1635,7 +1635,14 @@ async def send_marker_prep_cb(event):
     if aid in active_jobs:
         await event.answer("یک ارسال روی این اکانت در حال اجراست.", alert=True)
         return
-    await _do_marker_prep(event, uid, aid, acc)
+    # reserve during prep too (it opens a Rubika connection) so two rapid taps
+    # can't open two connections to the same session. send_go_cb re-reserves for
+    # the actual run; here we release as soon as prep is done.
+    active_jobs.add(aid)
+    try:
+        await _do_marker_prep(event, uid, aid, acc)
+    finally:
+        active_jobs.discard(aid)
 
 
 async def _do_marker_prep(event, uid, aid, acc):
@@ -1738,7 +1745,13 @@ async def send_upload_start_cb(event):
         ]), buttons=[[Button.inline("📌 بخشِ مارکر", b"marker")],
                      [Button.inline("🔙 منو", b"home")]])
         return
-    await _do_upload_prep(event, uid, aid, acc, up)
+    # reserve during prep (opens a Rubika connection); release once prep done.
+    # send_go_cb re-reserves for the actual run.
+    active_jobs.add(aid)
+    try:
+        await _do_upload_prep(event, uid, aid, acc, up)
+    finally:
+        active_jobs.discard(aid)
 
 
 async def _do_upload_prep(event, uid, aid, acc, up):
@@ -1844,9 +1857,11 @@ async def upload_config_capture(event):
     st = state.get(uid)
     if not st or st.get("step") != "await_upload_config":
         return  # not our flow -> let other handlers deal with it
+    # consume the conversation state up-front so a blocked/maintenance bounce
+    # can't leave the customer stuck in await_upload_config.
+    state.pop(uid, None)
     if db.is_blocked(uid) or db.maintenance_on():
         return
-    state.pop(uid, None)
     try:
         fname = event.file.name
     except Exception:

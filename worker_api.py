@@ -403,7 +403,9 @@ def _build_app():
         up_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "data", "uploads")
         os.makedirs(up_dir, exist_ok=True)
-        fname = body.file_name or "file.bin"
+        # sanitize: only the base name, never an attacker-controlled path that
+        # could escape up_dir (absolute path or ../ traversal).
+        fname = os.path.basename(body.file_name or "") or "file.bin"
         path = os.path.join(up_dir, fname)
         try:
             with open(path, "wb") as f:

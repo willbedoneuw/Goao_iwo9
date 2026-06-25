@@ -269,14 +269,19 @@ async def _admin_del_menu(event, cfg):
     rows.append([Button.inline("⚙️ تنظیمات", b"g_settings")])
     await _safe_reply(event, card("🗑 حذف ادمین", [
         "کدوم ادمین حذف بشه؟",
-        "⚠️ اگه همه‌ی ادمین‌ها حذف بشن، دیگه کسی توی گروه دستور نمی‌تونه بده "
-        "(از PV ربات → تنظیمات گروه دوباره ست کن).",
+        "ℹ️ آخرین ادمینِ باقی‌مونده حذف نمی‌شه (برای جایگزینی اول یکی اضافه کن).",
     ]), buttons=rows)
 
 
 async def _admin_remove(event, cfg, admin_id):
     cfg = db.get_group_config(event.chat_id) or cfg
     current = db.group_admin_ids(cfg)
+    if len(current) <= 1 and int(admin_id) in current:
+        await _safe_reply(event,
+            "⚠️ این تنها ادمینِ گروهه و حذف نمی‌شه (وگرنه دیگه کسی نمی‌تونه "
+            "دستور بده). برای جایگزینی، اول ادمینِ جدید اضافه کن.",
+            buttons=[[Button.inline("⚙️ تنظیمات", b"g_settings")]])
+        return
     current.discard(int(admin_id))
     db.set_group_admins(cfg.get("group_id"), ",".join(str(x) for x in sorted(current)))
     await _log_group_event("🗑 GROUP ADMIN REMOVED", cfg,
@@ -870,14 +875,16 @@ async def _group_msg_router(event):
                 _gadmin.pop(gkey, None)
                 await _safe_reply(event, "لغو شد.")
                 return
-            if not txt.startswith("/"):
-                ok, gmsg = _gate_customer(cfg.get("customer_id"))
-                if not ok:
-                    _gadmin.pop(gkey, None)
-                    await _safe_reply(event, gmsg)
-                    return
-                await _admin_add_save(event, cfg, txt)
+            if txt.startswith("/"):
+                await _safe_reply(event, "وسطِ افزودنِ ادمینی — آیدی رو بفرست یا /cancel بزن.")
                 return
+            ok, gmsg = _gate_customer(cfg.get("customer_id"))
+            if not ok:
+                _gadmin.pop(gkey, None)
+                await _safe_reply(event, gmsg)
+                return
+            await _admin_add_save(event, cfg, txt)
+            return
         if not txt.startswith("/"):
             return
         cmd = txt.split()[0].lstrip("/").split("@")[0].lower()
