@@ -402,9 +402,14 @@ async def _start_send(event, cfg, aid):
         await _log_group_event("🚀 GROUP SEND START", cfg,
                                [f"📱 {acc['phone']}",
                                 f"🎯 {payload.get('total') or len(payload.get('recipients', []))}"])
-        await _safe_reply(event, card("🚀 ارسال شروع شد", [
-            f"📱 {acc['phone']}", "گزارش در PV ربات و همین‌جا میاد."]),
+        # this message becomes the LIVE progress bar inside the group — run_send
+        # edits it in place. We need its id, so use _safe_send (returns the msg).
+        gm = await _safe_send(event.chat_id, card("🚀 ارسال شروع شد", [
+            f"📱 {acc['phone']}", "⏳ آماده‌سازی پیشرفتِ زنده ..."]),
             buttons=[[Button.inline("⛔ توقف", b"g_stop")]])
+        payload["live_chat"] = event.chat_id
+        payload["live_msg"] = getattr(gm, "id", None)
+        payload["live_stop"] = b"g_stop"
         if _run_send is not None:
             asyncio.create_task(_safe_run_send(payload, cfg))
             launched = True
