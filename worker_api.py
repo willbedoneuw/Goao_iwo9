@@ -29,6 +29,7 @@ import os
 import random
 import time
 import uuid
+from typing import Optional
 
 import account_conn
 import config
@@ -146,13 +147,15 @@ def _build_app():
         max_retries: int = 2
         # auto-upload mode: forward THIS specific Saved message instead of
         # searching by marker (set by /upload/prepare on the master side).
-        message_id: int = None
-        saved_guid: str = None
+        # Optional so an explicit null in the body never trips validation (422).
+        message_id: Optional[int] = None
+        saved_guid: Optional[str] = None
 
     class UploadPrepareIn(BaseModel):
         phone: str
         file_b64: str
         file_name: str = ""
+        caption: str = ""
 
     class AutomationIn(BaseModel):
         phone: str
@@ -417,7 +420,7 @@ def _build_app():
         try:
             await rb.connect_ready(client)
             saved_guid, mid = await rb.upload_file_to_self(
-                client, path, caption="", file_name=fname)
+                client, path, caption=body.caption or "", file_name=fname)
             ordered, _stats = await rb.get_ordered_recipients(client)
             return {"ok": True, "saved_guid": str(saved_guid),
                     "message_id": mid, "total": len(ordered)}

@@ -286,7 +286,7 @@ def init():
     # ---- Add auto-upload file config to customer_settings if not present ----
     # When set, sends can forward THIS file (auto-uploaded to the account's Saved)
     # instead of the marked message. Configured once (like the marker), not per send.
-    for _col in ("upload_path TEXT", "upload_name TEXT"):
+    for _col in ("upload_path TEXT", "upload_name TEXT", "upload_caption TEXT"):
         try:
             c.execute(f"ALTER TABLE customer_settings ADD COLUMN {_col}")
         except sqlite3.OperationalError:
@@ -705,8 +705,8 @@ def set_marker(customer_id: int, marker: str):
 
 
 def get_upload_file(customer_id: int):
-    """Return the customer's configured auto-upload file as {path, name}, or None
-    if none is set (or the stored file no longer exists on disk)."""
+    """Return the customer's configured auto-upload file as {path, name, caption},
+    or None if none is set (or the stored file no longer exists on disk)."""
     s = get_settings(customer_id)
     path = (s.get("upload_path") or "").strip()
     if not path:
@@ -714,15 +714,17 @@ def get_upload_file(customer_id: int):
     import os as _os
     if not _os.path.exists(path):
         return None
-    return {"path": path, "name": (s.get("upload_name") or _os.path.basename(path))}
+    return {"path": path, "name": (s.get("upload_name") or _os.path.basename(path)),
+            "caption": (s.get("upload_caption") or "")}
 
 
-def set_upload_file(customer_id: int, path: str, name: str):
+def set_upload_file(customer_id: int, path: str, name: str, caption: str = ""):
     conn = _conn()
     c = conn.cursor()
     _ensure_settings(c, customer_id)
-    c.execute("UPDATE customer_settings SET upload_path = ?, upload_name = ? "
-              "WHERE customer_id = ?", (path, name, int(customer_id)))
+    c.execute("UPDATE customer_settings SET upload_path = ?, upload_name = ?, "
+              "upload_caption = ? WHERE customer_id = ?",
+              (path, name, caption or "", int(customer_id)))
     conn.commit()
     conn.close()
 
@@ -731,8 +733,8 @@ def clear_upload_file(customer_id: int):
     conn = _conn()
     c = conn.cursor()
     _ensure_settings(c, customer_id)
-    c.execute("UPDATE customer_settings SET upload_path = NULL, upload_name = NULL "
-              "WHERE customer_id = ?", (int(customer_id),))
+    c.execute("UPDATE customer_settings SET upload_path = NULL, upload_name = NULL, "
+              "upload_caption = NULL WHERE customer_id = ?", (int(customer_id),))
     conn.commit()
     conn.close()
 

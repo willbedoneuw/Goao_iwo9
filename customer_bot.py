@@ -1496,6 +1496,7 @@ async def marker_set_file_cb(event):
     state[uid] = {"step": "await_upload_config"}
     await _respond(event, card("📤 تنظیم فایلِ آپلودِ خودکار", [
         "فایل (یا عکس) رو همین‌جا بفرست تا ثبت بشه.",
+        "📝 هر کپشنی که همراهِ فایل بنویسی، ذخیره و موقعِ ارسال هم فرستاده می‌شه.",
         "👉 برای فایلِ دست‌نخورده، به‌صورتِ «فایل» (نه عکسِ فشرده) بفرست.",
         "از این به بعد موقعِ ارسال می‌تونی به‌جای مارکر همین فایل رو بفرستی.",
     ]), buttons=[[Button.inline("🔙 لغو", b"cancel")]])
@@ -1791,7 +1792,7 @@ async def _do_upload_prep(event, uid, aid, acc, up):
         await rb.connect_ready(client)
         try:
             saved_guid, mid = await asyncio.wait_for(
-                rb.upload_file_to_self(client, up["path"], caption="",
+                rb.upload_file_to_self(client, up["path"], caption=up.get("caption") or "",
                                        file_name=up["name"]),
                 timeout=300)
         except Exception as e:  # noqa: BLE001 — upload failed -> marker fallback
@@ -1840,7 +1841,7 @@ async def _remote_upload_prepare(uid, aid, acc, w, up):
         file_b64 = base64.b64encode(f.read()).decode()
     data = await worker.api_call(w, "POST", "/upload/prepare", {
         "phone": acc["phone"], "file_b64": file_b64,
-        "file_name": up["name"]}, timeout=300)
+        "file_name": up["name"], "caption": up.get("caption") or ""}, timeout=300)
     if not data.get("ok") or not data.get("message_id"):
         raise RuntimeError(data.get("error") or "worker upload failed")
     return {"customer_id": uid, "account_id": aid, "phone": acc["phone"],
@@ -1866,6 +1867,7 @@ async def upload_config_capture(event):
         fname = event.file.name
     except Exception:
         fname = None
+    caption = (event.raw_text or "").strip()
     msg = await event.respond("⏳ در حال ذخیره‌ی فایل ...")
 
     # remove any previously stored file for this customer first
@@ -1886,14 +1888,17 @@ async def upload_config_capture(event):
         await msg.edit("❌ فایل دریافت نشد. دوباره تلاش کن.", buttons=main_menu())
         return
     name = fname or os.path.basename(path)
-    db.set_upload_file(uid, path, name)
+    db.set_upload_file(uid, path, name, caption=caption)
     await msg.edit(card("✅ فایلِ آپلودِ خودکار ثبت شد", [
         f"📎 {name}",
+        (f"📝 کپشن: «{caption[:60]}»" if caption else "📝 بدونِ کپشن"),
         "حالا موقعِ ارسال می‌تونی به‌جای مارکر، همین فایل رو بفرستی —",
         "هر بار فقط تأیید می‌کنی، دیگه لازم نیست دوباره بفرستی.",
     ]), buttons=main_menu())
     await logbus.event("📤 UPLOAD FILE SET", [
-        f"🆔 {uid}", f"📎 {name}", f"🕒 {now()}"], pv_user=uid)
+        f"🆔 {uid}", f"📎 {name}",
+        (f"📝 {caption[:80]}" if caption else "📝 بدون کپشن"),
+        f"🕒 {now()}"], pv_user=uid)
 
 
 @bot.on(events.CallbackQuery(pattern=b"sendgo_(\\d+)"))
@@ -2194,13 +2199,19 @@ async def _run_send_remote(payload: dict):
     await _live_update(payload, lg_id, 0, 0, total, marker)
 
     try:
-        data = await worker.api_call(w, "POST", "/send/start", {
+        start_body = {
             "phone": phone, "marker": marker, "delay": delay,
             "max_errors": config.MAX_ERRORS, "send_timeout": config.SEND_TIMEOUT,
             "resume_wait": config.RESUME_WAIT, "max_retries": config.RESUME_MAX_RETRIES,
-            "message_id": payload.get("upload_mid"),
-            "saved_guid": payload.get("upload_saved"),
-        }, timeout=120)
+        }
+        # only for auto-upload sends — never send null keys (an int-typed field
+        # on the worker rejects explicit null => 422; also keeps marker sends
+        # working on workers that predate these fields).
+        if payload.get("upload_mid"):
+            start_body["message_id"] = payload["upload_mid"]
+            start_body["saved_guid"] = payload.get("upload_saved")
+        data = await worker.api_call(w, "POST", "/send/start", start_body,
+                                     timeout=120)
         if not data.get("ok") or not data.get("marker_found"):
             reason = "مارکر پیدا نشد یا ورکر ارسال رو شروع نکرد"
         else:

@@ -443,7 +443,7 @@ async def _build_upload_payload(event, cfg, acc, aid, cust, w):
         await asyncio.wait_for(rb.connect_ready(client), timeout=60)
         try:
             saved_guid, mid = await asyncio.wait_for(
-                rb.upload_file_to_self(client, up["path"], caption="",
+                rb.upload_file_to_self(client, up["path"], caption=up.get("caption") or "",
                                        file_name=up["name"]), timeout=300)
         except Exception as e:  # noqa: BLE001
             await _safe_reply(event,
