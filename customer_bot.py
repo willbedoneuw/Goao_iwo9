@@ -1639,7 +1639,7 @@ async def run_send(payload: dict):
                         except Exception:
                             really_dead = False
                         if really_dead:
-                            reason = "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن"
+                            reason = f"🔴 سشنِ اکانت باطل — کد بله: {err_txt}"
                             db.set_status(account_id, "inactive")
                             try:
                                 await logbus.to_group(card(
