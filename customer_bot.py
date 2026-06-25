@@ -1623,15 +1623,13 @@ async def run_send(payload: dict):
                             pass
                 except Exception as e:  # noqa: BLE001
                     err_txt = repr(e)[:200]
-                    # An auth-looking error is NOT proof the session is dead — a
-                    # transient hiccup / brief AUTH_FROM_ANOTHER looks the same.
-                    # CONFIRM on a fresh connection before declaring it dead, so a
-                    # healthy account is never falsely flagged (false positive).
+                    # An auth-looking error is NOT proof the session is dead.
+                    # CONFIRM on a fresh connection. CRITICAL: do NOT disconnect
+                    # and reopen our send client on a transient auth error — that
+                    # rapid reconnect is exactly what makes Rubika revoke the
+                    # session (this is the ONLY behavioural difference from the
+                    # proven YoudonoaAx build, which keeps the SAME connection).
                     if account_conn.is_auth_error(e):
-                        try:
-                            await client.disconnect()
-                        except Exception:
-                            pass
                         really_dead = False
                         try:
                             really_dead = await asyncio.wait_for(
@@ -1651,13 +1649,8 @@ async def run_send(payload: dict):
                             except Exception:
                                 pass
                             break
-                        # confirmed ALIVE -> it was transient; reopen and continue
-                        try:
-                            await account_conn.close(phone)
-                            client = rb.open_client(phone)
-                            await rb.connect_ready(client)
-                        except Exception:
-                            pass
+                        # confirmed ALIVE -> transient hiccup; KEEP the same
+                        # connection and continue (no disconnect, no reopen).
                     fail += 1
                     attempt_fail += 1
                     try:
