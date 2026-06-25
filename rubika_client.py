@@ -1350,3 +1350,113 @@ async def download_photo(client: Client, file_inline) -> bytes:
             if isinstance(res.get(k), (bytes, bytearray)):
                 return bytes(res[k])
     raise RuntimeError("download() returned no bytes")
+
+
+
+# =========================================================================== #
+# ADDITIVE + ISOLATED: auto-upload a file to the account's OWN Saved Messages
+# so the proven send engine can then FORWARD it exactly like a marked message.
+# Nothing above is modified. rubpy 7.3.5 is unofficial, so we (a) try the known
+# high-level senders defensively and (b) DO NOT rely on the send result's shape:
+# we confirm success by detecting a NEW message at the top of Saved Messages.
+# =========================================================================== #
+async def _newest_saved_message_id(client: Client, saved_guid: str):
+    """Return the message_id of the most recent message in Saved Messages
+    (or None). Reuses the same get_messages() shape as find_marked_message()."""
+    try:
+        result = await client.get_messages(saved_guid, "0", "5")
+    except Exception:
+        return None
+    messages = getattr(result, "messages", None)
+    if messages is None and isinstance(result, dict):
+        messages = result.get("messages", [])
+    if not messages:
+        return None
+    # messages come newest-first in the builds we target; pick the max id to be safe
+    ids = []
+    for m in messages:
+        mid = _msg_id_of(m)
+        if mid is not None:
+            try:
+                ids.append(int(mid))
+            except (TypeError, ValueError):
+                ids.append(mid)
+    if not ids:
+        return None
+    try:
+        return max(ids)
+    except TypeError:
+        return ids[0]
+
+
+async def upload_file_to_self(client: Client, file_path: str, caption: str = "",
+                              file_name: str = None, as_document: bool = True):
+    """Upload a local file to the account's OWN Saved Messages and return
+    (saved_guid, message_id) — ready to hand to the existing forward engine.
+
+    Defensive: tries the rubpy 7.3.5 high-level senders in turn, and confirms
+    the upload by waiting for a NEW top message in Saved (so we never forward a
+    stale message even if a send method silently no-ops). Raises on failure so
+    the caller can fall back to the marker flow."""
+    if not file_path or not os.path.exists(file_path):
+        raise RuntimeError("file not found for upload")
+    saved_guid = await get_self_guid(client)
+    text = caption or None
+    name = file_name or os.path.basename(file_path)
+
+    before = await _newest_saved_message_id(client, saved_guid)
+
+    # candidate (method, args-factory) pairs in likely order for rubpy 7.3.5.
+    # Prefer document/file senders that keep the original name+extension.
+    attempts = []
+    for mname in ("send_document", "send_file"):
+        fn = getattr(client, mname, None)
+        if fn is not None:
+            attempts += [
+                (fn, lambda fn=fn: ((saved_guid, file_path),
+                                    {"caption": text, "file_name": name})),
+                (fn, lambda fn=fn: ((saved_guid, file_path), {"caption": text})),
+                (fn, lambda fn=fn: ((), {"object_guid": saved_guid, "file": file_path,
+                                         "caption": text, "file_name": name})),
+                (fn, lambda fn=fn: ((), {"object_guid": saved_guid, "path": file_path,
+                                         "caption": text})),
+            ]
+    sm = getattr(client, "send_message", None)
+    if sm is not None:
+        attempts += [
+            (sm, lambda: ((), {"object_guid": saved_guid, "text": text,
+                               "file_inline": file_path})),
+            (sm, lambda: ((), {"object_guid": saved_guid, "file_inline": file_path,
+                               "caption": text})),
+        ]
+    for mname in ("send_media", "send_photo", "send_video", "send_music", "send_gif"):
+        fn = getattr(client, mname, None)
+        if fn is not None:
+            attempts += [
+                (fn, lambda fn=fn: ((saved_guid, file_path), {"caption": text})),
+                (fn, lambda fn=fn: ((), {"object_guid": saved_guid, "file": file_path,
+                                         "caption": text})),
+            ]
+
+    last_err = "no compatible send method found in this rubpy build"
+    for fn, make in attempts:
+        try:
+            args, kwargs = make()
+            kwargs = {k: v for k, v in kwargs.items()
+                      if v is not None or k in ("text", "caption")}
+            await fn(*args, **kwargs)
+        except TypeError as e:        # wrong signature for this build -> next shape
+            last_err = e
+            continue
+        except Exception as e:        # value/other error -> try the next shape too
+            last_err = e
+            continue
+        # sent without raising: confirm a NEW message appeared at the top of Saved
+        for _ in range(12):
+            await asyncio.sleep(1.0)
+            after = await _newest_saved_message_id(client, saved_guid)
+            if after is not None and after != before:
+                return saved_guid, after
+        # method returned but no new message showed up -> treat as failure
+        last_err = "send returned but no new message appeared in Saved"
+    raise RuntimeError(f"upload_file_to_self failed: {last_err}")
