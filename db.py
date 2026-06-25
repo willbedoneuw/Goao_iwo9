@@ -299,6 +299,24 @@ def init():
         """
     )
 
+    # ---- group panel config (Config section): per-group install for a customer
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS group_config (
+            group_id     INTEGER PRIMARY KEY,
+            customer_id  INTEGER,
+            admin_ids    TEXT DEFAULT '',
+            content_type TEXT,
+            content_text TEXT,
+            media_path   TEXT,
+            enabled      INTEGER DEFAULT 1,
+            installed    INTEGER DEFAULT 0,
+            last_send_at TEXT,
+            created_at   TEXT
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -1480,3 +1498,100 @@ def mark_notification_sent(notif_id: int):
     conn.execute("UPDATE notifications SET sent = 1 WHERE id = ?", (int(notif_id),))
     conn.commit()
     conn.close()
+
+
+
+# =========================================================================== #
+# Group panel config (Config section).
+# =========================================================================== #
+def get_group_config(group_id: int):
+    conn = _conn()
+    row = conn.execute("SELECT * FROM group_config WHERE group_id = ?",
+                       (int(group_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_group_configs(customer_id: int) -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM group_config WHERE customer_id = ? "
+                        "ORDER BY group_id", (int(customer_id),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_group_configs(customer_id: int) -> int:
+    conn = _conn()
+    n = conn.execute("SELECT COUNT(*) AS n FROM group_config WHERE customer_id = ?",
+                     (int(customer_id),)).fetchone()["n"]
+    conn.close()
+    return int(n)
+
+
+def upsert_group_config(group_id: int, customer_id: int):
+    """Create the row for a group owned by this customer (no-op if exists with a
+    DIFFERENT owner — caller must check ownership first)."""
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO group_config (group_id, customer_id, created_at) "
+        "VALUES (?, ?, ?) ON CONFLICT(group_id) DO NOTHING",
+        (int(group_id), int(customer_id), config.now_str()))
+    conn.commit()
+    conn.close()
+
+
+def set_group_admins(group_id: int, admin_ids: str):
+    conn = _conn()
+    conn.execute("UPDATE group_config SET admin_ids = ? WHERE group_id = ?",
+                 (str(admin_ids), int(group_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_group_content(group_id: int, ctype, text, media_path):
+    conn = _conn()
+    conn.execute("UPDATE group_config SET content_type = ?, content_text = ?, "
+                 "media_path = ? WHERE group_id = ?",
+                 (ctype, text, media_path, int(group_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_group_enabled(group_id: int, enabled: bool):
+    conn = _conn()
+    conn.execute("UPDATE group_config SET enabled = ? WHERE group_id = ?",
+                 (1 if enabled else 0, int(group_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_group_installed(group_id: int, installed: bool):
+    conn = _conn()
+    conn.execute("UPDATE group_config SET installed = ? WHERE group_id = ?",
+                 (1 if installed else 0, int(group_id)))
+    conn.commit()
+    conn.close()
+
+
+def touch_group_send(group_id: int):
+    conn = _conn()
+    conn.execute("UPDATE group_config SET last_send_at = ? WHERE group_id = ?",
+                 (config.now_str(), int(group_id)))
+    conn.commit()
+    conn.close()
+
+
+def delete_group_config(group_id: int):
+    conn = _conn()
+    conn.execute("DELETE FROM group_config WHERE group_id = ?", (int(group_id),))
+    conn.commit()
+    conn.close()
+
+
+def group_admin_ids(cfg: dict) -> set:
+    """Parse the comma-separated admin_ids of a group_config row into a set of int."""
+    out = set()
+    for part in str((cfg or {}).get("admin_ids") or "").replace(" ", "").split(","):
+        if part.lstrip("-").isdigit():
+            out.add(int(part))
+    return out

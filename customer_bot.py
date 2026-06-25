@@ -37,6 +37,7 @@ import ratelimit
 import rubika_client as rb
 import tg_panel
 import bale_panel
+import group_panel
 import forcedjoin
 import tron
 import worker
@@ -119,6 +120,7 @@ def main_menu():
                      Button.inline("💰 موجودی", b"balance")])
     rows.append([Button.inline("📊 آمار من", b"mystats"),
                  Button.inline("📖 راهنما", b"help")])
+    rows.append([Button.inline("⚙️ تنظیمات گروه", b"gconf")])
     rows.append([Button.inline("🏠 منوی اصلی", b"mainmenu")])
     return rows
 
@@ -2267,6 +2269,239 @@ async def _run_pv_export(uid: int, acc):
 
 # --------------------------------------------------------------------------- #
 # Free-text router (drives the conversation state machine).
+GROUP_MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "data", "group_media")
+os.makedirs(GROUP_MEDIA_DIR, exist_ok=True)
+
+
+async def _gconf_menu(event, uid):
+    cfgs = db.list_group_configs(uid)
+    rows = []
+    for c in cfgs:
+        en = "🟢" if c.get("enabled") else "🔴"
+        rows.append([Button.inline(f"{en} گروه {c['group_id']}",
+                                   f"gconf_g_{c['group_id']}".encode())])
+    rows.append([Button.inline("➕ افزودن گروه", b"gconf_add")])
+    rows.append([Button.inline("🏠 منوی اصلی", b"mainmenu")])
+    body = ["گروه‌های ثبت‌شده‌ت رو اینجا مدیریت کن.",
+            "اول گروه رو اضافه کن، آیدی ادمین‌ها رو بذار، محتوا رو ست کن،",
+            "بعد ربات رو ادمینِ گروهت کن تا «نصب شد» بفرسته."]
+    if not cfgs:
+        body.append(LINE)
+        body.append("هنوز گروهی اضافه نکردی.")
+    await _respond(event, card("⚙️ تنظیمات گروه", body), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"gconf"))
+async def gconf_cb(event):
+    if not await _gate(event):
+        return
+    await _gconf_menu(event, event.sender_id)
+
+
+@bot.on(events.CallbackQuery(data=b"gconf_add"))
+async def gconf_add_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    if db.count_group_configs(uid) >= config.GROUP_MAX_PER_CUSTOMER:
+        await event.answer(f"به سقفِ {config.GROUP_MAX_PER_CUSTOMER} گروه رسیدی.",
+                           alert=True)
+        return
+    state[uid] = {"step": "await_gconf_group"}
+    await _respond(event, card("➕ افزودن گروه", [
+        "آیدیِ عددیِ گروهت رو بفرست (مثل `-1001234567890`).",
+        "آیدی رو می‌تونی از رباتایی مثل @username_to_id_bot بگیری.",
+    ]), buttons=[[Button.inline("🔙 لغو", b"gconf")]])
+
+
+async def _gconf_handle_group(event, st):
+    uid = event.sender_id
+    raw = (event.raw_text or "").strip().replace(" ", "")
+    if not raw.lstrip("-").isdigit():
+        await event.respond("آیدی نامعتبره. یک عددِ گروه بفرست (مثل -1001234567890).")
+        return
+    gid = int(raw)
+    existing = db.get_group_config(gid)
+    if existing and existing.get("customer_id") != uid:
+        state.pop(uid, None)
+        await event.respond("این گروه قبلاً توسط حساب دیگه‌ای ثبت شده.",
+                            buttons=main_menu())
+        return
+    if not existing and db.count_group_configs(uid) >= config.GROUP_MAX_PER_CUSTOMER:
+        state.pop(uid, None)
+        await event.respond(f"به سقفِ {config.GROUP_MAX_PER_CUSTOMER} گروه رسیدی.",
+                            buttons=main_menu())
+        return
+    db.upsert_group_config(gid, uid)
+    st["gid"] = gid
+    st["step"] = "await_gconf_admins"
+    await event.respond(card("👤 ادمین‌ها", [
+        f"گروه {gid} ثبت شد ✅",
+        "حالا آیدیِ عددیِ ادمین‌ها رو بفرست (خودت + هر کسی که اجازه‌ی دستوره).",
+        "چند آیدی رو با ویرگول جدا کن. مثال: `12345, 67890`",
+    ]), buttons=[[Button.inline("🔙 انصراف", b"gconf")]])
+    await logbus.event("⚙️ GROUP CONFIG ADD", [
+        f"🆔 {uid}", f"💬 گروه : {gid}", f"🕒 {now()}"], pv_user=uid)
+
+
+async def _gconf_handle_admins(event, st):
+    uid = event.sender_id
+    gid = st.get("gid")
+    if not gid:
+        state.pop(uid, None)
+        await event.respond("نشست منقضی شد. دوباره از «تنظیمات گروه» شروع کن.",
+                            buttons=main_menu())
+        return
+    ids = []
+    for part in (event.raw_text or "").replace(" ", "").split(","):
+        if part.lstrip("-").isdigit():
+            ids.append(part)
+    ids = ids[:config.GROUP_MAX_ADMINS]
+    if not ids:
+        await event.respond("هیچ آیدیِ معتبری نفرستادی. دوباره بفرست (مثل 12345,67890).")
+        return
+    db.set_group_admins(gid, ",".join(ids))
+    state.pop(uid, None)
+    await event.respond(card("✅ ادمین‌ها ثبت شد", [
+        f"💬 گروه : {gid}",
+        f"👤 ادمین‌ها : {', '.join(ids)}",
+        LINE,
+        "حالا «📦 محتوا» رو ست کن و بعد ربات رو ادمینِ گروهت کن.",
+    ]), buttons=[[Button.inline("📦 ست محتوا", f"gconf_content_{gid}".encode())],
+                 [Button.inline("🔙 تنظیمات گروه", b"gconf")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"gconf_g_(-?\\d+)"))
+async def gconf_group_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    gid = int(event.pattern_match.group(1).decode())
+    cfg = db.get_group_config(gid)
+    if not cfg or cfg.get("customer_id") != uid:
+        await event.answer("گروه پیدا نشد.", alert=True)
+        return
+    admins = ", ".join(str(x) for x in sorted(db.group_admin_ids(cfg))) or "-"
+    ct = cfg.get("content_type")
+    csum = ("📝 متن" if ct == "text" else "🖼 عکس" if ct == "photo"
+            else "📎 فایل" if ct == "file" else "تنظیم‌نشده ❌")
+    await _respond(event, card(f"⚙️ گروه {gid}", [
+        f"👤 ادمین‌ها : {admins}",
+        f"📦 محتوا : {csum}",
+        f"📥 نصب‌شده : {'بله ✅' if cfg.get('installed') else 'هنوز نه'}",
+        f"🔄 وضعیت : {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}",
+    ]), buttons=[
+        [Button.inline("👤 ادمین‌ها", f"gconf_admins_{gid}".encode()),
+         Button.inline("📦 محتوا", f"gconf_content_{gid}".encode())],
+        [Button.inline("🔴 خاموش" if cfg.get("enabled") else "🟢 روشن",
+                       f"gconf_toggle_{gid}".encode()),
+         Button.inline("🗑 حذف", f"gconf_del_{gid}".encode())],
+        [Button.inline("🔙 تنظیمات گروه", b"gconf")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"gconf_admins_(-?\\d+)"))
+async def gconf_admins_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    gid = int(event.pattern_match.group(1).decode())
+    cfg = db.get_group_config(gid)
+    if not cfg or cfg.get("customer_id") != uid:
+        await event.answer("گروه پیدا نشد.", alert=True)
+        return
+    state[uid] = {"step": "await_gconf_admins", "gid": gid}
+    await _respond(event, card("👤 ویرایش ادمین‌ها", [
+        f"💬 گروه : {gid}",
+        "آیدیِ عددیِ ادمین‌ها رو با ویرگول بفرست. مثال: `12345, 67890`",
+    ]), buttons=[[Button.inline("🔙 انصراف", f"gconf_g_{gid}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"gconf_content_(-?\\d+)"))
+async def gconf_content_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    gid = int(event.pattern_match.group(1).decode())
+    cfg = db.get_group_config(gid)
+    if not cfg or cfg.get("customer_id") != uid:
+        await event.answer("گروه پیدا نشد.", alert=True)
+        return
+    state[uid] = {"step": "await_gconf_content", "gid": gid}
+    await _respond(event, card("📦 ست محتوای ارسالی", [
+        f"💬 گروه : {gid}",
+        "محتوای ارسالی رو بفرست: متن، یا عکس/فایل با کپشن دلخواه.",
+        "لینک هم می‌تونه داخل متن باشه.",
+    ]), buttons=[[Button.inline("🔙 انصراف", f"gconf_g_{gid}".encode())]])
+
+
+async def _gconf_handle_content(event, st):
+    uid = event.sender_id
+    gid = st.get("gid")
+    if not gid or not db.get_group_config(gid):
+        state.pop(uid, None)
+        await event.respond("نشست منقضی شد. دوباره از «تنظیمات گروه» شروع کن.",
+                            buttons=main_menu())
+        return
+    msg = event.message
+    cap = (msg.text or "").strip()
+    try:
+        if msg.photo:
+            path = await msg.download_media(file=GROUP_MEDIA_DIR)
+            db.set_group_content(gid, "photo", msg.text or None, path)
+            label = "🖼 عکس"
+        elif msg.document:
+            path = await msg.download_media(file=GROUP_MEDIA_DIR)
+            db.set_group_content(gid, "file", msg.text or None, path)
+            label = "📎 فایل"
+        elif msg.text:
+            db.set_group_content(gid, "text", msg.text, None)
+            label = "📝 متن"
+        else:
+            await event.respond("❌ این نوع محتوا پشتیبانی نمی‌شه. متن/عکس/فایل بفرست.")
+            return
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"❌ خطا در ذخیرهٔ محتوا: {repr(e)[:120]}")
+        return
+    state.pop(uid, None)
+    await event.respond(card("✅ محتوا ذخیره شد", [
+        f"💬 گروه : {gid}", f"📦 نوع : {label}"]),
+        buttons=[[Button.inline("🔙 گروه", f"gconf_g_{gid}".encode())]])
+    await logbus.event("📦 GROUP CONTENT SET", [
+        f"🆔 {uid}", f"💬 گروه : {gid}", f"📦 {label}", f"🕒 {now()}"], pv_user=uid)
+
+
+@bot.on(events.CallbackQuery(pattern=b"gconf_toggle_(-?\\d+)"))
+async def gconf_toggle_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    gid = int(event.pattern_match.group(1).decode())
+    cfg = db.get_group_config(gid)
+    if not cfg or cfg.get("customer_id") != uid:
+        await event.answer("گروه پیدا نشد.", alert=True)
+        return
+    db.set_group_enabled(gid, not cfg.get("enabled"))
+    await gconf_group_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"gconf_del_(-?\\d+)"))
+async def gconf_del_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    gid = int(event.pattern_match.group(1).decode())
+    cfg = db.get_group_config(gid)
+    if not cfg or cfg.get("customer_id") != uid:
+        await event.answer("گروه پیدا نشد.", alert=True)
+        return
+    db.delete_group_config(gid)
+    await _respond(event, "گروه حذف شد. ✅",
+                   buttons=[[Button.inline("🔙 تنظیمات گروه", b"gconf")]])
+    await logbus.event("🗑 GROUP CONFIG DELETE", [
+        f"🆔 {uid}", f"💬 گروه : {gid}", f"🕒 {now()}"], pv_user=uid)
+
+
 # --------------------------------------------------------------------------- #
 @bot.on(events.NewMessage(func=lambda e: e.is_private and not (e.raw_text or "").startswith("/")))
 async def text_router(event):
@@ -2299,6 +2534,12 @@ async def text_router(event):
         await handle_code(event, st)
     elif step == "await_marker":
         await handle_marker(event, st)
+    elif step == "await_gconf_group":
+        await _gconf_handle_group(event, st)
+    elif step == "await_gconf_admins":
+        await _gconf_handle_admins(event, st)
+    elif step == "await_gconf_content":
+        await _gconf_handle_content(event, st)
 
 
 # --------------------------------------------------------------------------- #
@@ -2359,6 +2600,8 @@ async def amain():
     logbus.bind(bot)
     tg_panel.setup(bot, state)   # register the decoupled Telegram section
     bale_panel.setup(bot, state, tg_panel._state)   # decoupled Bale section
+    group_panel.setup(bot, run_send=run_send, active_jobs=active_jobs,
+                      stop_flags=stop_flags, pending_send=pending_send)
     await logbus.to_group(card("🤖 CUSTOMER BOT ONLINE", [
         f"🏷 Version : {config.VERSION}", f"🕒 {now()}"]))
     asyncio.create_task(expiry_loop())

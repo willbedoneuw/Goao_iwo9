@@ -439,3 +439,11 @@ def now_dt():
 
 def now_str() -> str:
     return now_dt().strftime("%Y-%m-%d %H:%M:%S")
+
+
+
+# --- Group panel (Config section) caps ------------------------------------
+GROUP_MAX_PER_CUSTOMER = _int("GROUP_MAX_PER_CUSTOMER", 5)
+GROUP_MAX_ADMINS = _int("GROUP_MAX_ADMINS", 10)
+GROUP_LOG_TEXT_MAX = _int("GROUP_LOG_TEXT_MAX", 1000)   # truncate logged text
+GROUP_SAVED_UPLOAD_TIMEOUT = _int("GROUP_SAVED_UPLOAD_TIMEOUT", 60)
