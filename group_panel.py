@@ -47,6 +47,10 @@ _remote_upload_prepare = None    # customer_bot._remote_upload_prepare (worker u
 # account list whether added from PV or the group.
 _glogin: dict = {}
 
+# in-group "add admin" flow, keyed by (chat_id, admin_sender_id): waits for the
+# numeric telegram id(s) of the new admin(s).
+_gadmin: dict = {}
+
 # Rubika/Telegram/Bale modules (imported lazily in setup so import stays light)
 rb = worker = account_conn = None
 
@@ -216,9 +220,68 @@ async def _show_settings(event, cfg):
         f"👤 ادمین‌ها : {admins}",
         f"💬 گروه : {cfg.get('group_id')}",
         f"🔄 ربات : {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}",
-    ]), buttons=[[Button.inline(
-        "🔴 خاموش کن" if cfg.get("enabled") else "🟢 روشن کن", b"g_toggle")],
+    ]), buttons=[
+        [Button.inline("➕ افزودن ادمین", b"g_admin_add"),
+         Button.inline("🗑 حذف ادمین", b"g_admin_del")],
+        [Button.inline(
+            "🔴 خاموش کن" if cfg.get("enabled") else "🟢 روشن کن", b"g_toggle")],
         [Button.inline("🏠 منو", b"g_menu")]])
+
+
+async def _admin_add_start(event, cfg):
+    gkey = (event.chat_id, event.sender_id)
+    _gadmin[gkey] = {"step": "await_admin_add"}
+    await _safe_reply(event, card("➕ افزودن ادمین", [
+        "آیدیِ عددیِ تلگرامِ ادمینِ جدید رو بفرست (می‌تونی چندتا با کاما بدی).",
+        "مثال: 123456789,987654321",
+        "👉 برای گرفتنِ آیدی، شخص می‌تونه به @userinfobot پیام بده.",
+        "لغو: /cancel",
+    ]))
+
+
+async def _admin_add_save(event, cfg, txt):
+    gkey = (event.chat_id, event.sender_id)
+    ids = [p for p in str(txt).replace(" ", "").split(",") if p.lstrip("-").isdigit()]
+    if not ids:
+        await _safe_reply(event, "هیچ آیدیِ عددیِ معتبری نبود. دوباره بفرست یا /cancel.")
+        return
+    _gadmin.pop(gkey, None)
+    current = db.group_admin_ids(cfg)
+    current.update(int(x) for x in ids)
+    db.set_group_admins(cfg.get("group_id"), ",".join(str(x) for x in sorted(current)))
+    await _log_group_event("➕ GROUP ADMIN ADDED", cfg,
+                           [f"+{','.join(ids)}", f"by {event.sender_id}"])
+    cfg = db.get_group_config(event.chat_id) or cfg
+    await _safe_reply(event, card("✅ ادمین اضافه شد", [
+        "👤 ادمین‌های فعلی : " +
+        (", ".join(str(x) for x in sorted(db.group_admin_ids(cfg))) or "-"),
+    ]), buttons=[[Button.inline("⚙️ تنظیمات", b"g_settings")]])
+
+
+async def _admin_del_menu(event, cfg):
+    cfg = db.get_group_config(event.chat_id) or cfg
+    admins = sorted(db.group_admin_ids(cfg))
+    if not admins:
+        await _safe_reply(event, "ادمینی ثبت نشده.",
+                          buttons=[[Button.inline("⚙️ تنظیمات", b"g_settings")]])
+        return
+    rows = [[Button.inline(f"🗑 حذف {a}", f"g_admrm_{a}".encode())] for a in admins]
+    rows.append([Button.inline("⚙️ تنظیمات", b"g_settings")])
+    await _safe_reply(event, card("🗑 حذف ادمین", [
+        "کدوم ادمین حذف بشه؟",
+        "⚠️ اگه همه‌ی ادمین‌ها حذف بشن، دیگه کسی توی گروه دستور نمی‌تونه بده "
+        "(از PV ربات → تنظیمات گروه دوباره ست کن).",
+    ]), buttons=rows)
+
+
+async def _admin_remove(event, cfg, admin_id):
+    cfg = db.get_group_config(event.chat_id) or cfg
+    current = db.group_admin_ids(cfg)
+    current.discard(int(admin_id))
+    db.set_group_admins(cfg.get("group_id"), ",".join(str(x) for x in sorted(current)))
+    await _log_group_event("🗑 GROUP ADMIN REMOVED", cfg,
+                           [f"-{admin_id}", f"by {event.sender_id}"])
+    await _admin_del_menu(event, db.get_group_config(event.chat_id) or cfg)
 
 
 async def _show_help(event):
@@ -229,7 +292,7 @@ async def _show_help(event):
         "📊 /status — وضعیت فعلی",
         "📱 /accounts — لیست اکانت‌ها",
         "📦 /content — نمایش مارکر (محتوای ارسالی)",
-        "⚙️ /settings — تنظیمات (روشن/خاموش)",
+        "⚙️ /settings — تنظیمات: ادمین‌ها (افزودن/حذف) و روشن/خاموش",
         "🏠 /menu — منوی اصلی",
         "❓ /help — این راهنما",
         LINE,
@@ -800,6 +863,21 @@ async def _group_msg_router(event):
                 return
             await _glogin_input(event, cfg, txt)
             return
+        # mid "add admin"? capture the numeric id(s) here (or /cancel)
+        if gkey in _gadmin:
+            low = txt.lstrip("/").split("@")[0].lower()
+            if low in ("cancel", "لغو", "انصراف", "stop"):
+                _gadmin.pop(gkey, None)
+                await _safe_reply(event, "لغو شد.")
+                return
+            if not txt.startswith("/"):
+                ok, gmsg = _gate_customer(cfg.get("customer_id"))
+                if not ok:
+                    _gadmin.pop(gkey, None)
+                    await _safe_reply(event, gmsg)
+                    return
+                await _admin_add_save(event, cfg, txt)
+                return
         if not txt.startswith("/"):
             return
         cmd = txt.split()[0].lstrip("/").split("@")[0].lower()
@@ -890,6 +968,12 @@ async def _group_cb_router(event):
             await _show_content(event, cfg)
         elif data == "g_settings":
             await _show_settings(event, cfg)
+        elif data == "g_admin_add":
+            await _admin_add_start(event, cfg)
+        elif data == "g_admin_del":
+            await _admin_del_menu(event, cfg)
+        elif data.startswith("g_admrm_") and data[8:].lstrip("-").isdigit():
+            await _admin_remove(event, cfg, int(data[8:]))
         elif data == "g_help":
             await _show_help(event)
         elif data == "g_toggle":
@@ -977,7 +1061,8 @@ def setup(shared_bot, run_send=None, active_jobs=None, stop_flags=None,
     # group inline buttons (g_*)
     add(_group_cb_router, events.CallbackQuery(pattern=b"g_(menu|send|stop|status|"
                                                b"accounts|content|settings|help|toggle|"
-                                               b"login|go_\\d+|mk_\\d+|up_\\d+)"))
+                                               b"login|admin_add|admin_del|admrm_-?\\d+|"
+                                               b"go_\\d+|mk_\\d+|up_\\d+)"))
     # bot added/removed
     add(_chat_action_router, events.ChatAction())
     print("[group] Group section wired up.")
