@@ -308,13 +308,36 @@ async def _start_send(event, cfg, aid):
             client = rb.open_client(acc["phone"])
             try:
                 await asyncio.wait_for(rb.connect_ready(client), timeout=60)
-                saved_guid, mid = await asyncio.wait_for(
-                    rb.find_marked_message(client, marker), timeout=120)
-                if not mid:
-                    await _safe_reply(event,
-                        f"❌ پیامی با مارکر «{marker}» تو Saved پیدا نشد. "
-                        "اول از PV ربات مارکر/محتوا رو ست کن.")
-                    return
+                ct = cfg.get("content_type")
+                ctext = cfg.get("content_text")
+                if ct == "text" and (ctext or "").strip():
+                    # USE THE GROUP's configured TEXT content (NOT the marker):
+                    # post it to Saved Messages, then locate it to forward it.
+                    self_guid = await asyncio.wait_for(
+                        rb.get_self_guid(client), timeout=30)
+                    await asyncio.wait_for(
+                        rb.send_text(client, self_guid, ctext), timeout=60)
+                    await asyncio.sleep(2)  # let Saved index the new message
+                    saved_guid, mid = await asyncio.wait_for(
+                        rb.find_marked_message(client, ctext), timeout=120)
+                    if not mid:
+                        await _safe_reply(event,
+                            "❌ ثبتِ محتوای متنیِ گروه در Saved ناموفق بود. "
+                            "کمی بعد دوباره /send بزن یا از روش مارکر استفاده کن.")
+                        return
+                else:
+                    # no text content set (or media) -> fall back to the marker
+                    if ct in ("photo", "file"):
+                        await _safe_reply(event,
+                            "ℹ️ ارسالِ عکس/فایلِ گروه از روی روبیکا فعلاً پشتیبانی "
+                            "نمی‌شه؛ از روش مارکر استفاده می‌کنم.")
+                    saved_guid, mid = await asyncio.wait_for(
+                        rb.find_marked_message(client, marker), timeout=120)
+                    if not mid:
+                        await _safe_reply(event,
+                            "❌ نه محتوای متنیِ گروه ست شده، نه پیامی با مارکر "
+                            f"«{marker}» تو Saved هست. از «📦 محتوا» متن رو ست کن.")
+                        return
                 ordered, _stats = await asyncio.wait_for(
                     rb.get_ordered_recipients(client), timeout=180)
             finally:
