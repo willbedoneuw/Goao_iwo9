@@ -2806,6 +2806,13 @@ async def gconf_verify_cb(event):
     db.set_group_installed(gid, in_group and is_admin)
     if in_group and is_admin:
         body = ["✅ ربات در گروه هست و ادمینه. آماده‌ی کاره!"]
+        # also post the welcome/install card INTO the group now — so it appears
+        # even if the bot was added before the group was configured (the
+        # ChatAction 'added' event may have fired with no config back then).
+        try:
+            await group_panel.send_install_card(gid)
+        except Exception:
+            pass
     elif in_group:
         body = ["⚠️ ربات در گروه هست ولی ادمین نیست.",
                 "برای فرستادن پیام و جواب‌دادن به دستورات، ربات رو ادمینِ گروه کن."]

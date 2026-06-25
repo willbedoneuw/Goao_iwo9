@@ -998,6 +998,30 @@ async def _group_cb_router(event):
             pass
 
 
+async def send_install_card(gid):
+    """Send the group welcome/install card to `gid`. Reusable so it can be
+    triggered both on ChatAction (bot added) AND from PV 'verify install' — so
+    the welcome appears regardless of the add/configure order. Never raises."""
+    try:
+        await _safe_send(gid, card("✅ ربات با موفقیت نصب شد!", [
+            "🤖 ربات ارسال آماده‌ی کاره.",
+            LINE,
+            "📌 دستورات:",
+            "  /send — شروع ارسال",
+            "  /login — افزودن اکانت روبیکا",
+            "  /stop — توقف",
+            "  /status — وضعیت",
+            "  /menu — منوی اصلی",
+            "  /help — راهنما",
+            LINE,
+            "👤 فقط ادمین‌های ست‌شده می‌تونن دستور بدن.",
+            "📦 محتوا و اکانت رو از PV ربات تنظیم کن.",
+            "🟢 آماده‌ی ارسال!",
+        ]), buttons=_group_menu())
+    except Exception:
+        pass
+
+
 async def _chat_action_router(event):
     """Bot added to / removed from a group."""
     try:
@@ -1009,21 +1033,7 @@ async def _chat_action_router(event):
             if me.id in (event.user_ids or []) or getattr(event, "user_id", None) == me.id:
                 if cfg:
                     db.set_group_installed(gid, True)
-                    await _safe_send(gid, card("✅ ربات با موفقیت نصب شد!", [
-                        "🤖 ربات ارسال آماده‌ی کاره.",
-                        LINE,
-                        "📌 دستورات:",
-                        "  /send — شروع ارسال",
-                        "  /login — افزودن اکانت روبیکا",
-                        "  /stop — توقف",
-                        "  /status — وضعیت",
-                        "  /menu — منوی اصلی",
-                        "  /help — راهنما",
-                        LINE,
-                        "👤 فقط ادمین‌های ست‌شده می‌تونن دستور بدن.",
-                        "📦 محتوا و اکانت رو از PV ربات تنظیم کن.",
-                        "🟢 آماده‌ی ارسال!",
-                    ]), buttons=_group_menu())
+                    await send_install_card(gid)
                     await _log_group_event("✅ BOT INSTALLED IN GROUP", cfg, [])
                 else:
                     await _log_group_event("⚠️ BOT ADDED TO UNCONFIGURED GROUP",
