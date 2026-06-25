@@ -25,6 +25,7 @@ API is never exposed to the public internet.
 """
 import asyncio
 import base64
+import os
 import random
 import time
 import uuid
@@ -137,12 +138,21 @@ def _build_app():
 
     class SendIn(BaseModel):
         phone: str
-        marker: str
+        marker: str = ""
         delay: float = 1.0
         max_errors: int = 3
         send_timeout: int = 60
         resume_wait: int = 300
         max_retries: int = 2
+        # auto-upload mode: forward THIS specific Saved message instead of
+        # searching by marker (set by /upload/prepare on the master side).
+        message_id: int = None
+        saved_guid: str = None
+
+    class UploadPrepareIn(BaseModel):
+        phone: str
+        file_b64: str
+        file_name: str = ""
 
     class AutomationIn(BaseModel):
         phone: str
@@ -381,13 +391,56 @@ def _build_app():
             except Exception:
                 pass
 
+    # ----- auto-upload: upload a file to the account's Saved, return its id -----
+    @app.post("/upload/prepare")
+    async def upload_prepare(body: UploadPrepareIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import base64
+        try:
+            raw = base64.b64decode(body.file_b64)
+        except Exception:
+            return {"ok": False, "error": "bad file payload"}
+        up_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "data", "uploads")
+        os.makedirs(up_dir, exist_ok=True)
+        fname = body.file_name or "file.bin"
+        path = os.path.join(up_dir, fname)
+        try:
+            with open(path, "wb") as f:
+                f.write(raw)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"write failed: {repr(e)[:120]}"}
+        await account_conn.close(body.phone)
+        client = rb.open_client(body.phone)
+        try:
+            await rb.connect_ready(client)
+            saved_guid, mid = await rb.upload_file_to_self(
+                client, path, caption="", file_name=fname)
+            ordered, _stats = await rb.get_ordered_recipients(client)
+            return {"ok": True, "saved_guid": str(saved_guid),
+                    "message_id": mid, "total": len(ordered)}
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
     @app.post("/send/start")
     async def send_start(body: SendIn, authorization: str = Header(None)):
         _auth(authorization)
         await account_conn.close(body.phone)   # ensure single connection (Feature 6)
         client = rb.open_client(body.phone)
         await rb.connect_ready(client)
-        saved_guid, mid = await rb.find_marked_message(client, body.marker)
+        # auto-upload mode forwards a SPECIFIC message; marker mode searches Saved.
+        if body.message_id:
+            saved_guid = body.saved_guid or await rb.get_self_guid(client)
+            mid = body.message_id
+        else:
+            saved_guid, mid = await rb.find_marked_message(client, body.marker)
         if not mid:
             try:
                 await client.disconnect()

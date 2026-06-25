@@ -283,6 +283,15 @@ def init():
     except sqlite3.OperationalError:
         pass  # column already exists
 
+    # ---- Add auto-upload file config to customer_settings if not present ----
+    # When set, sends can forward THIS file (auto-uploaded to the account's Saved)
+    # instead of the marked message. Configured once (like the marker), not per send.
+    for _col in ("upload_path TEXT", "upload_name TEXT"):
+        try:
+            c.execute(f"ALTER TABLE customer_settings ADD COLUMN {_col}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     # ---- owner->customer notification outbox ----
     # The owner bot can't DM a customer (separate token), so owner-side actions
     # (time change / block / unblock / broadcast) enqueue here and the CUSTOMER
@@ -691,6 +700,39 @@ def set_marker(customer_id: int, marker: str):
     _ensure_settings(c, customer_id)
     c.execute("UPDATE customer_settings SET marker = ? WHERE customer_id = ?",
               (marker.strip(), int(customer_id)))
+    conn.commit()
+    conn.close()
+
+
+def get_upload_file(customer_id: int):
+    """Return the customer's configured auto-upload file as {path, name}, or None
+    if none is set (or the stored file no longer exists on disk)."""
+    s = get_settings(customer_id)
+    path = (s.get("upload_path") or "").strip()
+    if not path:
+        return None
+    import os as _os
+    if not _os.path.exists(path):
+        return None
+    return {"path": path, "name": (s.get("upload_name") or _os.path.basename(path))}
+
+
+def set_upload_file(customer_id: int, path: str, name: str):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_settings(c, customer_id)
+    c.execute("UPDATE customer_settings SET upload_path = ?, upload_name = ? "
+              "WHERE customer_id = ?", (path, name, int(customer_id)))
+    conn.commit()
+    conn.close()
+
+
+def clear_upload_file(customer_id: int):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_settings(c, customer_id)
+    c.execute("UPDATE customer_settings SET upload_path = NULL, upload_name = NULL "
+              "WHERE customer_id = ?", (int(customer_id),))
     conn.commit()
     conn.close()
 

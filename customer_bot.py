@@ -1452,6 +1452,33 @@ async def run_health_check(uid: int):
 async def marker_cb(event):
     if not await _gate(event):
         return
+    await _show_content_menu(event, event.sender_id)
+
+
+async def _show_content_menu(event, uid):
+    marker = db.get_marker(uid)
+    up = db.get_upload_file(uid)
+    up_label = f"«{up['name']}» ✅" if up else "تنظیم‌نشده"
+    rows = [
+        [Button.inline("✏️ تغییر مارکر", b"mkr_text")],
+        [Button.inline("📤 تنظیم فایلِ آپلودِ خودکار", b"mkr_file")],
+    ]
+    if up:
+        rows.append([Button.inline("🗑 حذف فایلِ آپلود", b"mkr_filedel")])
+    rows.append([Button.inline("🔙 بازگشت", b"home")])
+    await _respond(event, card("📌 محتوای ارسال", [
+        f"📌 مارکر فعلی : «{marker}»",
+        f"📤 فایلِ آپلودِ خودکار : {up_label}",
+        LINE,
+        "موقعِ ارسال انتخاب می‌کنی «مارکر» بره یا همین «فایلِ ثبت‌شده».",
+        "فایل یک‌بار ثبت می‌شه؛ بعد هر ارسال فقط تأیید می‌کنی.",
+    ]), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"mkr_text"))
+async def marker_set_text_cb(event):
+    if not await _gate(event):
+        return
     uid = event.sender_id
     state[uid] = {"step": "await_marker"}
     await _respond(event,
@@ -1459,6 +1486,35 @@ async def marker_cb(event):
                    "مارکر جدید رو بفرست (همون متنی که آخرِ کپشنِ پیامِ نشان‌دار توی "
                    "Saved Messages روبیکاته):",
                    buttons=[[Button.inline("🔙 لغو", b"cancel")]])
+
+
+@bot.on(events.CallbackQuery(data=b"mkr_file"))
+async def marker_set_file_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    state[uid] = {"step": "await_upload_config"}
+    await _respond(event, card("📤 تنظیم فایلِ آپلودِ خودکار", [
+        "فایل (یا عکس) رو همین‌جا بفرست تا ثبت بشه.",
+        "👉 برای فایلِ دست‌نخورده، به‌صورتِ «فایل» (نه عکسِ فشرده) بفرست.",
+        "از این به بعد موقعِ ارسال می‌تونی به‌جای مارکر همین فایل رو بفرستی.",
+    ]), buttons=[[Button.inline("🔙 لغو", b"cancel")]])
+
+
+@bot.on(events.CallbackQuery(data=b"mkr_filedel"))
+async def marker_del_file_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    try:
+        old = db.get_upload_file(uid)
+        if old and os.path.exists(old["path"]):
+            os.remove(old["path"])
+    except Exception:
+        pass
+    db.clear_upload_file(uid)
+    await event.answer("فایلِ آپلود حذف شد.", alert=True)
+    await _show_content_menu(event, uid)
 
 
 async def handle_marker(event, st):
@@ -1550,14 +1606,20 @@ async def send_prepare_cb(event):
             "هر مشتری هم‌زمان فقط یک ارسال می‌تونه داشته باشه — "
             "اول اون تموم یا متوقف بشه.", alert=True)
         return
+    up = db.get_upload_file(uid)
+    rows = [[Button.inline("📌 مارکر", f"sendmk_{aid}".encode())]]
+    if up:
+        rows.append([Button.inline(f"📤 آپلودِ فایلِ «{up['name']}»",
+                                    f"sendup_{aid}".encode())])
+    rows.append([Button.inline("🔙 لغو", b"home")])
+    note = (f"📤 فایلِ آپلود: «{up['name']}» ثبت‌شده." if up
+            else "📤 فایلِ آپلود ثبت نشده — از بخشِ «📌 مارکر» می‌تونی تنظیمش کنی.")
     await _respond(event, card("🚀 ارسال", [
         f"📱 {acc['phone']}",
         "شیوه‌ی ارسال رو انتخاب کن:",
         "📌 مارکر — پیامی که خودت توی Saved علامت زدی فوروارد می‌شه.",
-        "📤 آپلود فایل — فایل رو همین‌جا بفرست؛ ربات خودش آپلود و ارسال می‌کنه.",
-    ]), buttons=[[Button.inline("📌 مارکر", f"sendmk_{aid}".encode())],
-                 [Button.inline("📤 آپلود خودکار فایل", f"sendup_{aid}".encode())],
-                 [Button.inline("🔙 لغو", b"home")]])
+        note,
+    ]), buttons=rows)
 
 
 @bot.on(events.CallbackQuery(pattern=b"sendmk_(\\d+)"))
@@ -1655,7 +1717,8 @@ async def _do_marker_prep(event, uid, aid, acc):
 
 @bot.on(events.CallbackQuery(pattern=b"sendup_(\\d+)"))
 async def send_upload_start_cb(event):
-    """Auto-upload path: ask the customer to send the file here."""
+    """Auto-upload path: use the customer's CONFIGURED file (set once in the
+    marker section) — upload it to the account's Saved, then prep the send."""
     if not await _gate(event):
         return
     uid = event.sender_id
@@ -1667,66 +1730,46 @@ async def send_upload_start_cb(event):
     if aid in active_jobs:
         await event.answer("یک ارسال روی این اکانت در حال اجراست.", alert=True)
         return
-    # auto-upload happens on the account's OWN session; for accounts hosted on a
-    # REMOTE worker we'd need a worker-side upload endpoint (not added yet), so
-    # we cleanly steer those to the marker flow.
+    up = db.get_upload_file(uid)
+    if not up:
+        await _respond(event, card("📤 آپلودِ خودکار", [
+            "هیچ فایلی ثبت نشده.",
+            "👉 اول از بخشِ «📌 مارکر» → «تنظیم فایلِ آپلودِ خودکار» فایل رو ثبت کن.",
+        ]), buttons=[[Button.inline("📌 بخشِ مارکر", b"marker")],
+                     [Button.inline("🔙 منو", b"home")]])
+        return
+    await _do_upload_prep(event, uid, aid, acc, up)
+
+
+async def _do_upload_prep(event, uid, aid, acc, up):
+    """Upload the configured file to the account's Saved + build the send payload.
+    Works for LOCAL and REMOTE (worker) accounts. On any failure -> marker."""
+    await _respond(event, f"⏳ آپلودِ فایلِ «{up['name']}» روی اکانت و آماده‌سازی لیست ...")
     w = worker.worker_for_account(acc)
+
+    # ----- REMOTE worker: upload via the worker API then prepare -----
     if w and not worker.is_local(w):
-        await _respond(event, card("📤 آپلود خودکار فایل", [
-            f"📱 {acc['phone']}",
-            "این اکانت روی ورکرِ دیگه‌ست و آپلودِ خودکار فعلاً فقط برای اکانت‌های "
-            "همین سرور کار می‌کنه.",
-            "👉 برای این اکانت از «📌 مارکر» استفاده کن.",
-        ]), buttons=[[Button.inline("📌 استفاده از مارکر", f"sendmk_{aid}".encode())],
+        try:
+            payload = await _remote_upload_prepare(uid, aid, acc, w, up)
+        except Exception as e:  # noqa: BLE001
+            await bot.send_message(uid, card("❌ آپلودِ خودکار ناموفق بود", [
+                f"💥 {repr(e)[:140]}", "👉 از روشِ «📌 مارکر» استفاده کن."]),
+                buttons=[[Button.inline("📌 استفاده از مارکر", f"sendmk_{aid}".encode())],
+                         [Button.inline("🔙 منو", b"home")]])
+            return
+        if payload is None:
+            return
+        pending_send[aid] = payload
+        await bot.send_message(uid, card("🚀 آماده‌ی ارسال", [
+            f"📱 {acc['phone']}", f"📤 فایلِ «{up['name']}» آپلود شد ✅",
+            f"🎯 تعداد گیرنده : {payload.get('total', 0)}",
+            f"⏱ تأخیر : {db.get_delay(uid)}s",
+            f"🖥 Worker : {w.get('tag') or w.get('id')}",
+        ]), buttons=[[Button.inline("✅ شروع ارسال", f"sendgo_{aid}".encode())],
                      [Button.inline("🔙 لغو", b"home")]])
         return
-    state[uid] = {"step": "await_upload_file", "aid": aid, "phone": acc["phone"]}
-    await _respond(event, card("📤 آپلود خودکار فایل", [
-        f"📱 {acc['phone']}",
-        "حالا فایل (یا عکس) رو همین‌جا بفرست. می‌تونی همراهش کپشن هم بنویسی.",
-        "فایل با همون اسم/پسوند آپلود می‌شه و بعد به مخاطبینت ارسال می‌شه.",
-        "👉 برای فایلِ دست‌نخورده، به‌صورتِ «فایل» (نه عکسِ فشرده) بفرست.",
-    ]), buttons=[[Button.inline("🔙 لغو", b"cancel")]])
 
-
-@bot.on(events.NewMessage(func=lambda e: e.is_private and e.file is not None))
-async def send_upload_file_capture(event):
-    """Capture the file the customer sends during the auto-upload flow, upload it
-    to the account's Saved Messages, then build the same payload the marker path
-    produces (so the proven send engine forwards it unchanged)."""
-    uid = event.sender_id
-    st = state.get(uid)
-    if not st or st.get("step") != "await_upload_file":
-        return  # not our flow -> let other handlers deal with it
-    if db.is_blocked(uid) or db.maintenance_on():
-        return
-    aid = st.get("aid")
-    acc = db.get_account_owned(aid, uid)
-    if not acc:
-        state.pop(uid, None)
-        await event.respond("اکانت پیدا نشد.", buttons=main_menu())
-        return
-    try:
-        fname = event.file.name
-    except Exception:
-        fname = None
-    caption = (event.raw_text or "").strip()
-    msg = await event.respond("⏳ در حال دریافت و آپلودِ فایل ...")
-
-    up_dir = os.path.join(DATA_DIR, "uploads")
-    os.makedirs(up_dir, exist_ok=True)
-    path = None
-    try:
-        path = await event.download_media(file=up_dir)
-    except Exception as e:  # noqa: BLE001
-        state.pop(uid, None)
-        await msg.edit(f"❌ دریافت فایل ناموفق: {repr(e)[:120]}", buttons=main_menu())
-        return
-    if not path:
-        state.pop(uid, None)
-        await msg.edit("❌ فایل دریافت نشد. دوباره تلاش کن.", buttons=main_menu())
-        return
-
+    # ----- LOCAL (master-as-worker) upload -----
     await account_conn.close(acc["phone"])
     client = rb.open_client(acc["phone"])
     saved_guid = mid = None
@@ -1735,33 +1778,27 @@ async def send_upload_file_capture(event):
         await rb.connect_ready(client)
         try:
             saved_guid, mid = await asyncio.wait_for(
-                rb.upload_file_to_self(client, path, caption=caption,
-                                       file_name=fname or os.path.basename(path)),
+                rb.upload_file_to_self(client, up["path"], caption="",
+                                       file_name=up["name"]),
                 timeout=300)
-        except Exception as e:  # noqa: BLE001 — upload failed -> fall back to marker
-            await msg.edit(card("❌ آپلودِ خودکار ناموفق بود", [
-                f"💥 {repr(e)[:140]}",
-                "👉 از روشِ «📌 مارکر» استفاده کن.",
-            ]), buttons=[[Button.inline("📌 استفاده از مارکر", f"sendmk_{aid}".encode())],
+        except Exception as e:  # noqa: BLE001 — upload failed -> marker fallback
+            await bot.send_message(uid, card("❌ آپلودِ خودکار ناموفق بود", [
+                f"💥 {repr(e)[:140]}", "👉 از روشِ «📌 مارکر» استفاده کن."]),
+                buttons=[[Button.inline("📌 استفاده از مارکر", f"sendmk_{aid}".encode())],
                          [Button.inline("🔙 منو", b"home")]])
             return
         ordered, _stats = await rb.get_ordered_recipients(client)
     except account_conn.InvalidAuthError:
         db.set_status(aid, "inactive")
-        await msg.edit("🔴 سشن این اکانت باطله. دوباره اضافه‌اش کن.", buttons=main_menu())
+        await bot.send_message(uid, "🔴 سشن این اکانت باطله. دوباره اضافه‌اش کن.",
+                               buttons=main_menu())
         return
     except Exception as e:  # noqa: BLE001
-        await msg.edit(f"❌ خطا: {repr(e)[:150]}", buttons=main_menu())
+        await bot.send_message(uid, f"❌ خطا: {repr(e)[:150]}", buttons=main_menu())
         return
     finally:
         try:
             await client.disconnect()
-        except Exception:
-            pass
-        state.pop(uid, None)
-        try:
-            if path and os.path.exists(path):
-                os.remove(path)
         except Exception:
             pass
 
@@ -1771,14 +1808,77 @@ async def send_upload_file_capture(event):
                          "mid": mid, "recipients": recipients}
     await logbus.event("📤 RB AUTO-UPLOAD OK", [
         f"🆔 {uid}", f"📱 {acc['phone']}",
-        f"📎 {fname or '-'}", f"🎯 {len(recipients)}", f"🕒 {now()}"], pv_user=uid)
-    await msg.edit(card("🚀 آماده‌ی ارسال", [
-        f"📱 {acc['phone']}",
-        "📤 فایل آپلود شد ✅",
+        f"📎 {up['name']}", f"🎯 {len(recipients)}", f"🕒 {now()}"], pv_user=uid)
+    await bot.send_message(uid, card("🚀 آماده‌ی ارسال", [
+        f"📱 {acc['phone']}", f"📤 فایلِ «{up['name']}» آپلود شد ✅",
         f"🎯 تعداد گیرنده : {len(recipients)}",
         f"⏱ تأخیر : {db.get_delay(uid)}s",
     ]), buttons=[[Button.inline("✅ شروع ارسال", f"sendgo_{aid}".encode())],
                  [Button.inline("🔙 لغو", b"home")]])
+
+
+async def _remote_upload_prepare(uid, aid, acc, w, up):
+    """Upload the configured file to a REMOTE worker's account (Saved Messages)
+    and return a send payload that forwards THAT message. Raises on failure so
+    the caller falls back to the marker flow. (Worker must run updated code with
+    the /upload/prepare endpoint — update workers from the owner panel.)"""
+    import base64
+    with open(up["path"], "rb") as f:
+        file_b64 = base64.b64encode(f.read()).decode()
+    data = await worker.api_call(w, "POST", "/upload/prepare", {
+        "phone": acc["phone"], "file_b64": file_b64,
+        "file_name": up["name"]}, timeout=300)
+    if not data.get("ok") or not data.get("message_id"):
+        raise RuntimeError(data.get("error") or "worker upload failed")
+    return {"customer_id": uid, "account_id": aid, "phone": acc["phone"],
+            "remote": True, "worker": w, "total": data.get("total", 0),
+            "upload_mid": data.get("message_id"),
+            "upload_saved": data.get("saved_guid")}
+
+
+@bot.on(events.NewMessage(func=lambda e: e.is_private and e.file is not None))
+async def upload_config_capture(event):
+    """Store the file the customer sends in the marker section as their persistent
+    auto-upload file (set once, reused every send)."""
+    uid = event.sender_id
+    st = state.get(uid)
+    if not st or st.get("step") != "await_upload_config":
+        return  # not our flow -> let other handlers deal with it
+    if db.is_blocked(uid) or db.maintenance_on():
+        return
+    state.pop(uid, None)
+    try:
+        fname = event.file.name
+    except Exception:
+        fname = None
+    msg = await event.respond("⏳ در حال ذخیره‌ی فایل ...")
+
+    # remove any previously stored file for this customer first
+    try:
+        old = db.get_upload_file(uid)
+        if old and os.path.exists(old["path"]):
+            os.remove(old["path"])
+    except Exception:
+        pass
+    store_dir = os.path.join(DATA_DIR, "upload_store", str(uid))
+    os.makedirs(store_dir, exist_ok=True)
+    try:
+        path = await event.download_media(file=store_dir)
+    except Exception as e:  # noqa: BLE001
+        await msg.edit(f"❌ دریافت فایل ناموفق: {repr(e)[:120]}", buttons=main_menu())
+        return
+    if not path:
+        await msg.edit("❌ فایل دریافت نشد. دوباره تلاش کن.", buttons=main_menu())
+        return
+    name = fname or os.path.basename(path)
+    db.set_upload_file(uid, path, name)
+    await msg.edit(card("✅ فایلِ آپلودِ خودکار ثبت شد", [
+        f"📎 {name}",
+        "حالا موقعِ ارسال می‌تونی به‌جای مارکر، همین فایل رو بفرستی —",
+        "هر بار فقط تأیید می‌کنی، دیگه لازم نیست دوباره بفرستی.",
+    ]), buttons=main_menu())
+    await logbus.event("📤 UPLOAD FILE SET", [
+        f"🆔 {uid}", f"📎 {name}", f"🕒 {now()}"], pv_user=uid)
 
 
 @bot.on(events.CallbackQuery(pattern=b"sendgo_(\\d+)"))
@@ -2083,6 +2183,8 @@ async def _run_send_remote(payload: dict):
             "phone": phone, "marker": marker, "delay": delay,
             "max_errors": config.MAX_ERRORS, "send_timeout": config.SEND_TIMEOUT,
             "resume_wait": config.RESUME_WAIT, "max_retries": config.RESUME_MAX_RETRIES,
+            "message_id": payload.get("upload_mid"),
+            "saved_guid": payload.get("upload_saved"),
         }, timeout=120)
         if not data.get("ok") or not data.get("marker_found"):
             reason = "مارکر پیدا نشد یا ورکر ارسال رو شروع نکرد"
