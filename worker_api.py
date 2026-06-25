@@ -424,6 +424,9 @@ def _build_app():
             ordered, _stats = await rb.get_ordered_recipients(client)
             return {"ok": True, "saved_guid": str(saved_guid),
                     "message_id": mid, "total": len(ordered)}
+        except Exception as e:  # noqa: BLE001 — NEVER 500; return a clean error so
+            # the master falls back to the marker flow instead of crashing.
+            return {"ok": False, "error": f"upload failed: {repr(e)[:160]}"}
         finally:
             try:
                 await client.disconnect()
@@ -439,21 +442,29 @@ def _build_app():
         _auth(authorization)
         await account_conn.close(body.phone)   # ensure single connection (Feature 6)
         client = rb.open_client(body.phone)
-        await rb.connect_ready(client)
-        # auto-upload mode forwards a SPECIFIC message; marker mode searches Saved.
-        if body.message_id:
-            saved_guid = body.saved_guid or await rb.get_self_guid(client)
-            mid = body.message_id
-        else:
-            saved_guid, mid = await rb.find_marked_message(client, body.marker)
-        if not mid:
+        try:
+            await rb.connect_ready(client)
+            # auto-upload mode forwards a SPECIFIC message; marker mode searches Saved.
+            if body.message_id:
+                saved_guid = body.saved_guid or await rb.get_self_guid(client)
+                mid = body.message_id
+            else:
+                saved_guid, mid = await rb.find_marked_message(client, body.marker)
+            if not mid:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return {"ok": False, "marker_found": False, "total": 0}
+            ordered, _stats = await rb.get_ordered_recipients(client)
+            recipients = [r["guid"] for r in ordered]
+        except Exception as e:  # noqa: BLE001 — never 500; report cleanly
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            return {"ok": False, "marker_found": False, "total": 0}
-        ordered, _stats = await rb.get_ordered_recipients(client)
-        recipients = [r["guid"] for r in ordered]
+            return {"ok": False, "marker_found": False, "total": 0,
+                    "error": f"prepare failed: {repr(e)[:160]}"}
 
         job_id = uuid.uuid4().hex[:12]
         job = {"phone": body.phone, "total": len(recipients), "ok": 0, "fail": 0,
