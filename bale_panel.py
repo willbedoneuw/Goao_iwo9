@@ -483,7 +483,18 @@ async def _handle_phone(event, st):
         return
     client = Client(session_file=_sess_path(phone))
     try:
-        resp = await client.start_phone_auth(_phone_int(phone))
+        resp = await asyncio.wait_for(
+            client.start_phone_auth(_phone_int(phone)), timeout=30)
+    except asyncio.TimeoutError:
+        await event.respond("❌ بله پاسخ نداد (تایم‌اوت). بعداً دوباره امتحان کن.",
+                            buttons=_menu())
+        try:
+            await client.stop()
+        except Exception:
+            pass
+        _drop_client(client)
+        _state.pop(uid, None)
+        return
     except Exception as e:  # noqa: BLE001
         _logx("start_phone_auth", e)
         await event.respond(f"❌ خطا در ارسال کد: {repr(e)[:140]}")
@@ -529,7 +540,19 @@ async def _handle_code(event, st):
         return
     code = "".join(ch for ch in (event.raw_text or "") if ch.isdigit())
     try:
-        res = await p["client"].validate_code(code, p["tx"])
+        res = await asyncio.wait_for(
+            p["client"].validate_code(code, p["tx"]), timeout=30)
+    except asyncio.TimeoutError:
+        await event.respond("❌ بله بیش از حد طول کشید. لغو شد — بعداً دوباره امتحان کن.",
+                            buttons=_menu())
+        _pending.pop(uid, None)
+        _state.pop(uid, None)
+        try:
+            await p["client"].stop()
+        except Exception:
+            pass
+        _drop_client(p["client"])
+        return
     except Exception as e:  # noqa: BLE001
         _logx("validate_code", e)
         await event.respond(f"❌ خطا در بررسی کد: {repr(e)[:140]}\nدوباره کد رو بفرست.")
@@ -561,7 +584,19 @@ async def _handle_password(event, st):
         return
     pwd = (event.raw_text or "").strip()
     try:
-        res = await p["client"].validate_password(pwd, p["tx"])
+        res = await asyncio.wait_for(
+            p["client"].validate_password(pwd, p["tx"]), timeout=30)
+    except asyncio.TimeoutError:
+        await event.respond("❌ بله بیش از حد طول کشید. لغو شد — بعداً دوباره امتحان کن.",
+                            buttons=_menu())
+        _pending.pop(uid, None)
+        _state.pop(uid, None)
+        try:
+            await p["client"].stop()
+        except Exception:
+            pass
+        _drop_client(p["client"])
+        return
     except Exception as e:  # noqa: BLE001
         _logx("validate_password", e)
         await event.respond(f"❌ خطا در بررسی رمز: {repr(e)[:140]}\nدوباره رمز رو بفرست.")
@@ -601,7 +636,8 @@ async def _finish_login(event):
     try:
         async with _session(phone) as client:
             me_id = getattr(client, "id", None)
-            nc, npv, ng = await _counts(client, me_id)
+            nc, npv, ng = await asyncio.wait_for(
+                _counts(client, me_id), timeout=30)
     except Exception as e:  # noqa: BLE001
         _logx("login counts", e)
 
