@@ -40,6 +40,12 @@ _stop_flags = None        # customer_bot.stop_flags dict
 _pending_send = None      # customer_bot.pending_send dict
 _customer_active_account = None  # customer_bot.customer_active_account (per-customer guard)
 
+# in-group Rubika login flow, keyed by (chat_id, admin_sender_id). Mirrors the
+# PV add-account flow (phone -> code -> optional 2FA) but writes the account
+# under the GROUP's customer_id (shared DB) so it shows up in that customer's
+# account list whether added from PV or the group.
+_glogin: dict = {}
+
 # Rubika/Telegram/Bale modules (imported lazily in setup so import stays light)
 rb = worker = account_conn = None
 
@@ -87,6 +93,7 @@ def _group_menu():
          Button.inline("📊 وضعیت", b"g_status")],
         [Button.inline("📱 اکانت‌ها", b"g_accounts"),
          Button.inline("📌 مارکر", b"g_content")],
+        [Button.inline("➕ افزودن اکانت", b"g_login")],
         [Button.inline("⚙️ تنظیمات", b"g_settings")],
         [Button.inline("📖 راهنما", b"g_help")],
     ]
@@ -217,6 +224,7 @@ async def _show_help(event):
     await _safe_reply(event, card("📖 راهنمای ربات", [
         "🚀 /send — انتخاب اکانت و شروع ارسال",
         "🚀 /send_<شماره یا شماره‌تلفن> — ارسال با اون اکانت (از /accounts)",
+        "➕ /login — افزودن اکانت روبیکا (شماره → کد → رمز دومرحله‌ای)",
         "📊 /status — وضعیت فعلی",
         "📱 /accounts — لیست اکانت‌ها",
         "📦 /content — نمایش مارکر (محتوای ارسالی)",
@@ -443,6 +451,207 @@ async def _do_stop(event, cfg):
 
 
 # --------------------------------------------------------------------------- #
+# In-group Rubika login (reuses the SAME primitives as the PV add-account flow:
+# rb.start_login / rb.finish_login / worker /login API / db.add_account). The
+# account is registered under the GROUP's customer_id. Fully guarded.
+# --------------------------------------------------------------------------- #
+async def _glogin_start(event, cfg):
+    gkey = (event.chat_id, event.sender_id)
+    _glogin[gkey] = {"step": "await_phone", "owner": cfg.get("customer_id")}
+    await _safe_reply(event, card("➕ افزودن اکانت روبیکا", [
+        "📱 شماره‌ی اکانت روبیکا رو بفرست. مثال: 09123456789",
+        "بعدش کدِ تأیید (و در صورت وجود، رمزِ دومرحله‌ای) رو می‌فرستی.",
+        LINE,
+        "⚠️ کد/رمز توی همین گروه دیده می‌شه؛ اگه حساسه از PV ربات لاگین کن.",
+        "لغو: /cancel",
+    ]))
+
+
+async def _glogin_phone(event, cfg, st, txt):
+    phone = rb.normalize_phone((txt or "").strip())
+    if not phone or len(phone) < 10:
+        await _safe_reply(event, "شماره نامعتبره. دوباره بفرست. (یا /cancel)")
+        return
+    try:
+        w = await worker.pick_worker_for_login()
+    except Exception:
+        w = None
+    if not w:
+        w = worker.ensure_master_worker()
+    st["worker"] = w
+    gkey = (event.chat_id, event.sender_id)
+
+    # ----- REMOTE worker login relay (same endpoints as PV) -----
+    if w and not worker.is_local(w):
+        try:
+            data = await worker.api_call(w, "POST", "/login/start", {"phone": phone})
+        except Exception:
+            _glogin.pop(gkey, None)
+            await _safe_reply(event, "❌ ارتباط با ورکر برقرار نشد. کمی بعد دوباره /login بزن.")
+            return
+        st["ctx"] = {"phone": phone, "remote": True, "worker": w}
+        if data.get("needs_password"):
+            st["step"] = "await_password"
+            await _safe_reply(event, "🔐 این اکانت رمزِ دومرحله‌ای داره. رمز رو بفرست:")
+        else:
+            st["step"] = "await_code"
+            await _safe_reply(event, "✉️ کدی که روبیکا فرستاده رو بفرست:")
+        return
+
+    # ----- LOCAL (master-as-worker) login -----
+    try:
+        await account_conn.close(phone)
+    except Exception:
+        pass
+    try:
+        ctx = await rb.start_login(phone)
+    except Exception as e:  # noqa: BLE001
+        _glogin.pop(gkey, None)
+        await _safe_reply(event, f"❌ خطا در شروع لاگین: {repr(e)[:140]}")
+        return
+    st["ctx"] = ctx
+    if "PASS" in str(ctx.get("status") or "").upper():
+        st["step"] = "await_password"
+        await _safe_reply(event, "🔐 این اکانت رمزِ دومرحله‌ای داره. رمز رو بفرست:")
+    else:
+        st["step"] = "await_code"
+        await _safe_reply(event, "✉️ کدی که روبیکا فرستاده رو بفرست:")
+
+
+async def _glogin_password(event, cfg, st, txt):
+    pwd = (txt or "").strip()
+    ctx = st.get("ctx")
+    gkey = (event.chat_id, event.sender_id)
+    if not ctx:
+        _glogin.pop(gkey, None)
+        await _safe_reply(event, "نشست لاگین منقضی شد. دوباره /login بزن.")
+        return
+    if isinstance(ctx, dict) and ctx.get("remote"):
+        w = ctx.get("worker") or st.get("worker")
+        phone = ctx["phone"]
+        try:
+            await worker.api_call(w, "POST", "/login/password",
+                                  {"phone": phone, "password": pwd})
+        except Exception:
+            await _safe_reply(event, "❌ رمز پذیرفته نشد یا ارتباط با ورکر قطع شد. دوباره بفرست.")
+            return
+        st["step"] = "await_code"
+        await _safe_reply(event, "✉️ کدی که روبیکا فرستاده رو بفرست:")
+        return
+    phone = ctx["phone"]
+    try:
+        ctx = await rb.start_login(phone, pass_key=pwd)
+    except Exception as e:  # noqa: BLE001
+        await _safe_reply(event, f"❌ رمز پذیرفته نشد: {repr(e)[:140]}")
+        return
+    st["ctx"] = ctx
+    st["step"] = "await_code"
+    await _safe_reply(event, "✉️ کدی که روبیکا فرستاده رو بفرست:")
+
+
+async def _glogin_code(event, cfg, st, txt):
+    gkey = (event.chat_id, event.sender_id)
+    ctx = st.get("ctx")
+    owner = st.get("owner") or cfg.get("customer_id")
+    if not ctx:
+        _glogin.pop(gkey, None)
+        await _safe_reply(event, "نشست لاگین منقضی شد. دوباره /login بزن.")
+        return
+    code = "".join(ch for ch in (txt or "") if ch.isdigit())
+
+    # ----- REMOTE worker login relay -----
+    if isinstance(ctx, dict) and ctx.get("remote"):
+        w = ctx.get("worker") or st.get("worker") or {}
+        phone = ctx["phone"]
+        try:
+            data = await worker.api_call(w, "POST", "/login/code",
+                                         {"phone": phone, "code": code})
+        except Exception:
+            _glogin.pop(gkey, None)
+            await _safe_reply(event, "❌ ورود ناموفق (ارتباط با ورکر قطع شد). دوباره /login بزن.")
+            return
+        _glogin.pop(gkey, None)
+        if not data.get("ok"):
+            await _safe_reply(event, "❌ ورود ناموفق.")
+            return
+        name = data.get("name") or "-"
+        guid = data.get("guid") or "-"
+        try:
+            aid = db.add_account(owner, phone, name, str(guid))
+            if w.get("id"):
+                db.set_account_worker(aid, w["id"])
+        except Exception as e:  # noqa: BLE001
+            await _safe_reply(event, f"❌ ثبت اکانت ناموفق: {repr(e)[:120]}")
+            return
+        await _safe_reply(event, card("✅ اکانت اضافه شد", [
+            f"📛 {name}", f"📱 {phone}",
+            f"👥 مخاطبین : {data.get('contacts', 0)}",
+            f"💬 چت‌ها : {data.get('with_chat', 0)}",
+            "حالا با /send می‌تونی باهاش ارسال بزنی."]))
+        await _log_group_event("➕ GROUP ADD ACCOUNT", cfg, [
+            f"📱 {phone} ({name})", f"👥 {data.get('contacts', 0)}",
+            f"🖥 {w.get('tag') or w.get('id')}", f"by admin {event.sender_id}"])
+        return
+
+    # ----- LOCAL (master-as-worker) login -----
+    phone = ctx["phone"]
+    try:
+        await rb.finish_login(ctx, code)
+        client = ctx["client"]
+        me = await client.get_me()
+        guid = rb._guid_of(me) or "-"
+        name = rb._name_of(me)
+        _ordered, stats = await rb.get_ordered_recipients(client)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    except Exception as e:  # noqa: BLE001
+        _glogin.pop(gkey, None)
+        await _safe_reply(event, f"❌ ورود ناموفق: {repr(e)[:160]}")
+        return
+    _glogin.pop(gkey, None)
+    w = st.get("worker") or worker.ensure_master_worker() or {}
+    try:
+        aid = db.add_account(owner, phone, name, str(guid))
+        if w.get("id"):
+            db.set_account_worker(aid, w["id"])
+    except Exception as e:  # noqa: BLE001
+        await _safe_reply(event, f"❌ ثبت اکانت ناموفق: {repr(e)[:120]}")
+        return
+    await _safe_reply(event, card("✅ اکانت اضافه شد", [
+        f"📛 {name}", f"📱 {phone}",
+        f"👥 مخاطبین : {stats.get('contacts', 0)}",
+        f"💬 چت‌ها : {stats.get('with_chat', 0)}",
+        "حالا با /send می‌تونی باهاش ارسال بزنی."]))
+    await _log_group_event("➕ GROUP ADD ACCOUNT", cfg, [
+        f"📱 {phone} ({name})", f"👥 {stats.get('contacts', 0)}",
+        f"🖥 {w.get('tag') or w.get('id')}", f"by admin {event.sender_id}"])
+
+
+async def _glogin_input(event, cfg, txt):
+    """Route the next free-text message to the active login step. Guarded."""
+    gkey = (event.chat_id, event.sender_id)
+    st = _glogin.get(gkey)
+    if not st:
+        return
+    step = st.get("step")
+    try:
+        if step == "await_phone":
+            await _glogin_phone(event, cfg, st, txt)
+        elif step == "await_password":
+            await _glogin_password(event, cfg, st, txt)
+        elif step == "await_code":
+            await _glogin_code(event, cfg, st, txt)
+    except Exception as e:  # noqa: BLE001
+        _glogin.pop(gkey, None)
+        try:
+            await _safe_reply(event, f"❌ خطای لاگین: {repr(e)[:120]}")
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Routers (all wrapped — a bug here must never crash the bot).
 # --------------------------------------------------------------------------- #
 def _gate_customer(cust):
@@ -486,6 +695,24 @@ async def _group_msg_router(event):
         if not admins or event.sender_id not in admins:
             return
         txt = (event.raw_text or "").strip()
+        gkey = (event.chat_id, event.sender_id)
+        # mid-login? capture phone / code / password here (or /cancel)
+        if gkey in _glogin:
+            low = txt.lstrip("/").split("@")[0].lower()
+            if low in ("cancel", "لغو", "انصراف", "stop"):
+                _glogin.pop(gkey, None)
+                await _safe_reply(event, "لاگین لغو شد.")
+                return
+            if txt.startswith("/"):
+                await _safe_reply(event, "وسطِ لاگینی — ورودی رو بفرست یا /cancel بزن.")
+                return
+            ok, gmsg = _gate_customer(cfg.get("customer_id"))
+            if not ok:
+                _glogin.pop(gkey, None)
+                await _safe_reply(event, gmsg)
+                return
+            await _glogin_input(event, cfg, txt)
+            return
         if not txt.startswith("/"):
             return
         cmd = txt.split()[0].lstrip("/").split("@")[0].lower()
@@ -519,6 +746,8 @@ async def _group_msg_router(event):
             await _show_status(event, cfg)
         elif cmd == "accounts":
             await _show_accounts(event, cfg)
+        elif cmd in ("login", "addacc", "add"):
+            await _glogin_start(event, cfg)
         elif cmd == "content":
             await _show_content(event, cfg)
         elif cmd == "settings":
@@ -564,6 +793,8 @@ async def _group_cb_router(event):
             await _show_status(event, cfg)
         elif data == "g_accounts":
             await _show_accounts(event, cfg)
+        elif data == "g_login":
+            await _glogin_start(event, cfg)
         elif data == "g_content":
             await _show_content(event, cfg)
         elif data == "g_settings":
@@ -653,7 +884,7 @@ def setup(shared_bot, run_send=None, active_jobs=None, stop_flags=None,
     # group inline buttons (g_*)
     add(_group_cb_router, events.CallbackQuery(pattern=b"g_(menu|send|stop|status|"
                                                b"accounts|content|settings|help|toggle|"
-                                               b"go_\\d+)"))
+                                               b"login|go_\\d+)"))
     # bot added/removed
     add(_chat_action_router, events.ChatAction())
     print("[group] Group section wired up.")
