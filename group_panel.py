@@ -446,6 +446,33 @@ async def _do_stop(event, cfg):
 # --------------------------------------------------------------------------- #
 # Routers (all wrapped — a bug here must never crash the bot).
 # --------------------------------------------------------------------------- #
+def _gate_customer(cust):
+    """Mirror customer_bot._gate for the GROUP context: block / maintenance /
+    subscription validity. Returns (ok: bool, message: str|None).
+
+    A blocked or unpaid customer must NOT be able to send via their group and
+    bypass the PV gate. Fully guarded — on any unexpected error it FAILS OPEN
+    (allows) so a transient DB hiccup can never lock a legit customer out of
+    their own group; the real enforcement runs whenever the DB answers."""
+    try:
+        if cust is None:
+            return True, None
+        if db.is_blocked(cust):
+            return False, ("⛔ حساب شما مسدود است. برای رفع مسدودی با پشتیبانی "
+                           "در تماس باش.")
+        if db.maintenance_on():
+            return False, "🛠 ربات در حال تعمیر است. کمی بعد دوباره امتحان کن."
+        if config.FREE_MODE:
+            c = db.get_customer(cust) or {}
+            if (c.get("expires_at") or "") and db.seconds_left(cust) <= 0:
+                return False, "🔴 زمانِ دسترسی‌ات تموم شده. با پشتیبانی تماس بگیر."
+        elif not db.is_active(cust):
+            return False, "🔴 برای استفاده، اول اشتراک تهیه کن (از PV ربات)."
+    except Exception:
+        return True, None
+    return True, None
+
+
 async def _group_msg_router(event):
     try:
         if event.is_private:
@@ -463,6 +490,16 @@ async def _group_msg_router(event):
         if not txt.startswith("/"):
             return
         cmd = txt.split()[0].lstrip("/").split("@")[0].lower()
+        # block / maintenance / subscription gate (mirrors PV _gate) — a blocked
+        # or unpaid customer can't act in their group. /help stays open so they
+        # can still read how to reach support.
+        if cmd != "help":
+            ok, gmsg = _gate_customer(cfg.get("customer_id"))
+            if not ok:
+                await _safe_reply(event, gmsg)
+                await _log_group_event("⛔ GROUP ACTION BLOCKED", cfg,
+                                       [f"cmd=/{cmd}", f"by {event.sender_id}"])
+                return
         if cmd in ("menu", "start", "panel"):
             await _show_menu(event, cfg)
         elif cmd == "send":
@@ -506,6 +543,16 @@ async def _group_cb_router(event):
             await event.answer("فقط ادمین‌های ست‌شده.", alert=True)
             return
         data = (event.data or b"").decode(errors="ignore")
+        # block / maintenance / subscription gate (mirrors PV _gate). g_stop and
+        # g_help bypass it: a customer must ALWAYS be able to stop a running send
+        # and read the help, even if their account just got blocked/expired.
+        if data not in ("g_stop", "g_help"):
+            ok, gmsg = _gate_customer(cfg.get("customer_id"))
+            if not ok:
+                await event.answer(gmsg, alert=True)
+                await _log_group_event("⛔ GROUP ACTION BLOCKED", cfg,
+                                       [f"cb={data}", f"by {event.sender_id}"])
+                return
         if data == "g_menu":
             await _show_menu(event, cfg)
         elif data == "g_send":
