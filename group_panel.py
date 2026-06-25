@@ -92,15 +92,6 @@ def _group_menu():
     ]
 
 
-def _content_summary(cfg) -> str:
-    ct = (cfg or {}).get("content_type")
-    if not ct:
-        return "تنظیم‌نشده ❌"
-    if ct == "text":
-        return "📝 متن"
-    return "🖼 عکس + کپشن" if ct == "photo" else "📎 فایل + کپشن"
-
-
 # --------------------------------------------------------------------------- #
 # Central logging of EVERYTHING that happens in a customer's group (owner-only).
 # The customer never sees these — they go to the central log group.
@@ -234,6 +225,9 @@ async def _show_help(event):
         "❓ /help — این راهنما",
         LINE,
         "⛔ توقفِ ارسال: روی دکمهٔ «توقف» که موقع ارسال میاد بزن.",
+        "📊 موقع ارسال یه نوارِ پیشرفتِ زنده همین‌جا (و در PV ربات) نشون داده می‌شه.",
+        "ℹ️ هر زمان فقط یک ارسالِ هم‌زمان مجازه؛ تا ارسالِ فعلی تموم/متوقف نشه، "
+        "ارسالِ جدید رد می‌شه.",
         "⚠️ فقط ادمین‌های ست‌شده می‌تونن دستور بدن؛ بقیه نادیده گرفته می‌شن.",
     ]), buttons=[[Button.inline("🏠 منو", b"g_menu")]])
 
