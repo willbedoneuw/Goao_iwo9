@@ -1287,7 +1287,7 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                         except Exception:
                             pass
                         if await _handle_auth_error(body.phone):
-                            job["reason"] = "invalid_auth"
+                            job["reason"] = f"invalid_auth: {repr(e)[:140]}"
                             return
                         # confirmed ALIVE -> transient; reopen and keep going
                         try:

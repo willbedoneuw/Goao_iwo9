@@ -1848,8 +1848,10 @@ async def _run_send_remote(payload: dict):
                     raw = stt.get("reason")
                     if raw == "manual_stop":
                         reason = "توقف دستی توسط کاربر"
-                    elif raw == "invalid_auth":
-                        reason = "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن"
+                    elif raw and str(raw).startswith("invalid_auth"):
+                        tok = str(raw)[len("invalid_auth"):].lstrip(": ").strip()
+                        reason = (f"🔴 سشنِ اکانت باطل — کد بله: {tok}" if tok
+                                  else "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن")
                         try:
                             db.set_status(account_id, "inactive")
                         except Exception:
