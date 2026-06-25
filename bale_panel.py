@@ -456,6 +456,18 @@ async def bale_addacc_cb(event):
     if not await _gate(event):
         return
     uid = event.sender_id
+    # TEMPORARILY DISABLED: aiobale's login flow blocks the Telethon event loop
+    # and crashes the entire customer bot (database-is-locked cascade). Login
+    # must be run in a subprocess to be safe. Use the test script for now:
+    #   systemctl stop goao-customer
+    #   ./venv/bin/python bale_send_test.py   (or add manually via script)
+    #   systemctl start goao-customer
+    await _respond(event, card("➕ بله › افزودن اکانت", [
+        "⚠️ افزودنِ اکانت بله موقتاً غیرفعاله (باعث ناپایداری ربات می‌شد).",
+        "برای افزودن اکانت با پشتیبانی تماس بگیر.",
+    ]), buttons=_back_home())
+    return
+    # --- original code below (will be re-enabled after subprocess fix) ---
     cap = config.BALE_MAX_ACCOUNTS
     if cap and db.count_customer_bale_accounts(uid) >= cap:
         await _respond(event, card("➕ افزودن اکانت", [
