@@ -559,14 +559,12 @@ async def _start_send(event, cfg, aid, mode="marker"):
         await _log_group_event("🚀 GROUP SEND START", cfg,
                                [f"📱 {acc['phone']}",
                                 f"🎯 {payload.get('total') or len(payload.get('recipients', []))}"])
-        # this message becomes the LIVE progress bar inside the group — run_send
-        # edits it in place. We need its id, so use _safe_send (returns the msg).
-        gm = await _safe_send(event.chat_id, card("🚀 ارسال شروع شد", [
-            f"📱 {acc['phone']}", "⏳ آماده‌سازی پیشرفتِ زنده ..."]),
+        # send a simple 'started' message (with stop button). Progress comes as a
+        # periodic SEND PROGRESS card here + in the log group (no live editing).
+        await _safe_reply(event, card("🚀 ارسال شروع شد", [
+            f"📱 {acc['phone']}", "گزارشِ پیشرفت (هر ۵۰ تا) همین‌جا و در گروهِ لاگ میاد."]),
             buttons=[[Button.inline("⛔ توقف", b"g_stop")]])
-        payload["live_chat"] = event.chat_id
-        payload["live_msg"] = getattr(gm, "id", None)
-        payload["live_stop"] = b"g_stop"
+        payload["notify_chat"] = event.chat_id
         if _run_send is not None:
             asyncio.create_task(_safe_run_send(payload, cfg))
             launched = True
@@ -891,7 +889,7 @@ async def _group_msg_router(event):
         # block / maintenance / subscription gate (mirrors PV _gate) — a blocked
         # or unpaid customer can't act in their group. /help stays open so they
         # can still read how to reach support.
-        if cmd != "help":
+        if cmd not in ("help", "stop"):
             ok, gmsg = _gate_customer(cfg.get("customer_id"))
             if not ok:
                 await _safe_reply(event, gmsg)
@@ -916,6 +914,8 @@ async def _group_msg_router(event):
                     "شماره یا شماره‌تلفنِ اکانت نامعتبره. /accounts رو ببین.")
         elif cmd == "status":
             await _show_status(event, cfg)
+        elif cmd == "stop":
+            await _do_stop(event, cfg)
         elif cmd == "accounts":
             await _show_accounts(event, cfg)
         elif cmd in ("login", "addacc", "add"):
@@ -1013,13 +1013,13 @@ async def _chat_action_router(event):
                         "🤖 ربات ارسال آماده‌ی کاره.",
                         LINE,
                         "📌 دستورات:",
-                        "  /send — انتخاب اکانت و شروع ارسال",
-                        "  /send_<شماره> — ارسال با اکانتِ شماره‌دار",
+                        "  /send — شروع ارسال",
+                        "  /login — افزودن اکانت روبیکا",
+                        "  /stop — توقف",
                         "  /status — وضعیت",
                         "  /menu — منوی اصلی",
                         "  /help — راهنما",
                         LINE,
-                        "⛔ توقف: دکمهٔ «توقف» موقع ارسال.",
                         "👤 فقط ادمین‌های ست‌شده می‌تونن دستور بدن.",
                         "📦 محتوا و اکانت رو از PV ربات تنظیم کن.",
                         "🟢 آماده‌ی ارسال!",

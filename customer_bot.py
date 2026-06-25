@@ -99,86 +99,46 @@ def customer_active_account(customer_id: int, exclude_aid: int = None):
 
 
 # --------------------------------------------------------------------------- #
-# Live send progress (one EDITED message instead of spamming new ones) — mirrors
-# the Telegram section's live bar. Rendered in the originating chat (PV or the
-# customer's group) AND, in parallel, in the central log group. Fully guarded:
-# a logging/edit failure must never affect the actual send.
+# Send progress: a periodic "SEND PROGRESS" card (every N sends) posted to the
+# originating chat (the customer's group if started there, else their PV) AND
+# always to the central log group. Fully guarded: a logging failure must never
+# affect the actual send.
 # --------------------------------------------------------------------------- #
-def _send_bar(done: int, total: int) -> str:
-    if total <= 0:
-        return "…"
-    frac = max(0.0, min(1.0, done / total))
-    n = 10
-    filled = int(frac * n)
-    return "▓" * filled + "░" * (n - filled) + f" {int(frac * 100)}%"
+def _pct(ok, total):
+    return int((ok / total) * 100) if total else 0
 
 
-def _live_progress_card(phone, ok, fail, total, marker=None):
-    rows = [
-        f"📱 {phone}",
-        f"📊 {_send_bar(ok + fail, total)}",
-        f"✅ موفق : {ok}    ❌ ناموفق : {fail}",
-        f"🎯 کل گیرنده : {total}",
-    ]
-    if marker:
-        rows.append(f"📌 مارکر : «{marker}»")
-    rows.append(f"🕒 {now()}")
-    return card("🚀 ارسال روبیکا (زنده)", rows)
+def _progress_card(payload, ok, fail, total):
+    """The periodic 'SEND PROGRESS' card (posted every N sends — NOT live-edited)."""
+    phone = payload.get("phone")
+    w = payload.get("worker") or {}
+    tag = (w.get("tag") or w.get("id")) if w else None
+    head = f"📱 {phone}" + (f" (ورکر #{tag})" if tag else "")
+    done = ok + fail
+    remaining = max(0, total - done)
+    return card("📊 SEND PROGRESS", [
+        head,
+        f"✅ {ok} از {total} — {_pct(ok, total)}%",
+        f"⏳ باقی‌مونده : {remaining}",
+        f"🕒 {now()}",
+    ])
 
 
-def _live_final_card(phone, ok, fail, total, dur, reason=None):
-    head = "⛔ ارسال متوقف شد" if reason else "✅ ارسال کامل شد"
-    rate = f"{(ok / total * 100):.0f}%" if total else "0%"
-    rows = [
-        f"📱 {phone}",
-        f"📊 {_send_bar(ok + fail, total)}",
-        f"✅ موفق : {ok}    ❌ ناموفق : {fail}",
-        f"🎯 کل : {total}    📈 نرخ موفقیت : {rate}",
-        f"⏱ مدت : {dur}",
-    ]
-    if reason:
-        rows.append(f"⚠️ دلیل : {reason}")
-    rows.append(f"🕒 {now()}")
-    return card(head, rows)
-
-
-async def _live_open_loggroup(payload):
-    """Open a live-progress message in the central log group; return its id (or
-    None). The owner sees the SAME live bar the customer sees. Never raises."""
-    if not config.LOG_GROUP_ID:
-        return None
+async def _post_progress(payload, ok, fail, total):
+    """Post the progress card to the ORIGINATING chat (the customer's group if the
+    send started there, or their PV) AND always to the central log group.
+    Fully guarded — never affects the actual send."""
+    text = _progress_card(payload, ok, fail, total)
+    chat = payload.get("notify_chat")
+    if chat:
+        try:
+            await bot.send_message(chat, text)
+        except Exception:
+            pass
     try:
-        total = payload.get("total") or len(payload.get("recipients") or [])
-        m = await bot.send_message(
-            config.LOG_GROUP_ID,
-            _live_progress_card(payload.get("phone"), 0, 0, total))
-        return getattr(m, "id", None)
+        await logbus.to_group(text)
     except Exception:
-        return None
-
-
-async def _live_update(payload, lg_id, ok, fail, total, marker=None,
-                       final=False, dur=None, reason=None):
-    """Edit the originating live message (keeping its stop button while sending)
-    and the log-group live message. Never raises."""
-    if final:
-        text = _live_final_card(payload.get("phone"), ok, fail, total, dur, reason)
-    else:
-        text = _live_progress_card(payload.get("phone"), ok, fail, total, marker)
-    lc, lm = payload.get("live_chat"), payload.get("live_msg")
-    if lc and lm:
-        btns = None
-        if not final and payload.get("live_stop"):
-            btns = [[Button.inline("⛔ توقف", payload["live_stop"])]]
-        try:
-            await bot.edit_message(lc, lm, text, buttons=btns)
-        except Exception:
-            pass
-    if lg_id and config.LOG_GROUP_ID:
-        try:
-            await bot.edit_message(config.LOG_GROUP_ID, lg_id, text)
-        except Exception:
-            pass
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1926,19 +1886,15 @@ async def send_go_cb(event):
     # owns its release in its finally; _safe_launch_send guarantees release even
     # if run_send raises before reaching its own finally.
     active_jobs.add(aid)
-    # turn the confirmation message into the LIVE progress message — run_send
-    # edits it in place (no more spammy progress messages). Its id is stable
-    # (event.message_id), so the engine can keep editing it.
-    total0 = len(payload.get("recipients") or []) or payload.get("total", 0)
+    # show a simple 'started' message (with stop button); progress comes as a
+    # periodic SEND PROGRESS card here + in the log group (no live editing).
     try:
-        await event.edit(
-            _live_progress_card(payload.get("phone"), 0, 0, total0),
-            buttons=[[Button.inline("⛔ توقف", f"sendstop_{aid}".encode())]])
+        await event.edit("🚀 ارسال شروع شد. گزارشِ پیشرفت (هر ۵۰ تا) همین‌جا و در "
+                         "گروهِ لاگ میاد.",
+                         buttons=[[Button.inline("⛔ توقف", f"sendstop_{aid}".encode())]])
     except Exception:
         pass
-    payload["live_chat"] = event.sender_id
-    payload["live_msg"] = getattr(event, "message_id", None)
-    payload["live_stop"] = f"sendstop_{aid}".encode()
+    payload["notify_chat"] = event.sender_id
     asyncio.create_task(_safe_launch_send(payload))
 
 
@@ -2023,9 +1979,6 @@ async def run_send(payload: dict):
     n = total
     idx = 0
     retry_count = 0
-    lg_id = await _live_open_loggroup(payload)
-    await _live_update(payload, lg_id, 0, 0, total, marker)
-    last_live = 0.0
     await account_conn.close(phone)
     client = rb.open_client(phone)
     try:
@@ -2092,12 +2045,11 @@ async def run_send(payload: dict):
                     if attempt_fail >= config.MAX_ERRORS:
                         hit_max = True
                         break
-                # live progress bar (EDIT one message, throttled ~2.5s) — PV/group
-                # + the log group. Reflects both successes and failures.
-                t = _time.monotonic()
-                if t - last_live >= 2.5:
-                    last_live = t
-                    await _live_update(payload, lg_id, ok, fail, total, marker)
+                # periodic progress card (every N sends) -> originating chat + log group
+                step = config.SEND_PROGRESS_STEP or 50
+                if ok - prog_logged >= step:
+                    prog_logged = ok
+                    await _post_progress(payload, ok, fail, total)
                 await asyncio.sleep(delay)
 
             if reason:
@@ -2140,21 +2092,17 @@ async def run_send(payload: dict):
         pending_send.pop(account_id, None)
 
     dur = str(datetime.now() - started).split(".")[0]
-    await _live_update(payload, lg_id, ok, fail, total, final=True,
-                       dur=dur, reason=reason)
     if reason:
         await logbus.event("⛔ SEND STOPPED", [
             f"🆔 {uid}", f"📱 {phone}",
             f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
             f"⚠️ {reason}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
-        if payload.get("live_chat") != uid:
-            await _safe_send(uid, f"⛔ ارسال متوقف شد. ✅ {ok} / ❌ {fail} از {total}\nدلیل: {reason}")
+        await _safe_send(uid, f"⛔ ارسال متوقف شد. ✅ {ok} / ❌ {fail} از {total}\nدلیل: {reason}")
     else:
         await logbus.event("✅ SEND FINISHED", [
             f"🆔 {uid}", f"📱 {phone}",
             f"✅ {ok}   ❌ {fail}   📁 {total}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
-        if payload.get("live_chat") != uid:
-            await _safe_send(uid, f"✅ ارسال تمام شد. ✅ {ok} / ❌ {fail} از {total}")
+        await _safe_send(uid, f"✅ ارسال تمام شد. ✅ {ok} / ❌ {fail} از {total}")
 
 
 async def _safe_send(uid, text):
@@ -2194,9 +2142,6 @@ async def _run_send_remote(payload: dict):
         f"📌 Marker : «{marker}» ✅",
         f"🖥 Worker : {w.get('tag') or w.get('id')}",
         f"🕒 {now()}"], pv_user=uid)
-
-    lg_id = await _live_open_loggroup(payload)
-    await _live_update(payload, lg_id, 0, 0, total, marker)
 
     try:
         start_body = {
@@ -2275,10 +2220,11 @@ async def _run_send_remote(payload: dict):
                         f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
                         f"🕒 {now()}"], pv_user=uid)
                 last_state = cur_state
-                # live progress bar — EDIT one message (PV/group + log group)
-                # instead of spamming. Polled ~5s, so refresh every poll.
-                if total:
-                    await _live_update(payload, lg_id, ok, fail, total, marker)
+                # periodic progress card (every N sends) -> originating chat + log group
+                step = config.SEND_PROGRESS_STEP or 50
+                if total and ok - prog_logged >= step:
+                    prog_logged = ok
+                    await _post_progress(payload, ok, fail, total)
                 if stt.get("done"):
                     raw = stt.get("reason")
                     if raw == "manual_stop":
@@ -2312,21 +2258,17 @@ async def _run_send_remote(payload: dict):
             pass
 
     dur = str(datetime.now() - started).split(".")[0]
-    await _live_update(payload, lg_id, ok, fail, total, final=True,
-                       dur=dur, reason=reason)
     if reason:
         await logbus.event("⛔ SEND STOPPED", [
             f"🆔 {uid}", f"📱 {phone}",
             f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
             f"⚠️ {reason}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
-        if payload.get("live_chat") != uid:
-            await _safe_send(uid, f"⛔ ارسال متوقف شد. ✅ {ok} / ❌ {fail} از {total}\nدلیل: {reason}")
+        await _safe_send(uid, f"⛔ ارسال متوقف شد. ✅ {ok} / ❌ {fail} از {total}\nدلیل: {reason}")
     else:
         await logbus.event("✅ SEND FINISHED", [
             f"🆔 {uid}", f"📱 {phone}",
             f"✅ {ok}   ❌ {fail}   📁 {total}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
-        if payload.get("live_chat") != uid:
-            await _safe_send(uid, f"✅ ارسال تمام شد. ✅ {ok} / ❌ {fail} از {total}")
+        await _safe_send(uid, f"✅ ارسال تمام شد. ✅ {ok} / ❌ {fail} از {total}")
 
 
 # --------------------------------------------------------------------------- #
