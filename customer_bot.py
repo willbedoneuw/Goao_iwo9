@@ -2367,8 +2367,9 @@ async def _gconf_handle_admins(event, st):
         f"💬 گروه : {gid}",
         f"👤 ادمین‌ها : {', '.join(ids)}",
         LINE,
-        "حالا «📦 محتوا» رو ست کن و بعد ربات رو ادمینِ گروهت کن.",
-    ]), buttons=[[Button.inline("📦 ست محتوا", f"gconf_content_{gid}".encode())],
+        "محتوای ارسالی از روی «📌 مارکر» تعیین می‌شه (هم گروه هم پیوی).",
+        "مارکر رو از منوی اصلی PV → «📌 مارکر» ست کن، بعد ربات رو ادمینِ گروهت کن.",
+    ]), buttons=[[Button.inline("🔍 بررسی نصب", f"gconf_verify_{gid}".encode())],
                  [Button.inline("🔙 تنظیمات گروه", b"gconf")]])
 
 
@@ -2383,18 +2384,15 @@ async def gconf_group_cb(event):
         await event.answer("گروه پیدا نشد.", alert=True)
         return
     admins = ", ".join(str(x) for x in sorted(db.group_admin_ids(cfg))) or "-"
-    ct = cfg.get("content_type")
-    csum = ("📝 متن" if ct == "text" else "🖼 عکس" if ct == "photo"
-            else "📎 فایل" if ct == "file" else "تنظیم‌نشده ❌")
+    marker = db.get_marker(uid)
     await _respond(event, card(f"⚙️ گروه {gid}", [
         f"👤 ادمین‌ها : {admins}",
-        f"📦 محتوا : {csum}",
+        f"📌 مارکر : «{marker}»",
         f"📥 نصب‌شده : {'بله ✅' if cfg.get('installed') else 'هنوز نه'}",
         f"🔄 وضعیت : {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}",
     ]), buttons=[
         [Button.inline("👤 ادمین‌ها", f"gconf_admins_{gid}".encode()),
-         Button.inline("📦 محتوا", f"gconf_content_{gid}".encode())],
-        [Button.inline("🔍 بررسی نصب", f"gconf_verify_{gid}".encode())],
+         Button.inline("🔍 بررسی نصب", f"gconf_verify_{gid}".encode())],
         [Button.inline("🔴 خاموش" if cfg.get("enabled") else "🟢 روشن",
                        f"gconf_toggle_{gid}".encode()),
          Button.inline("🗑 حذف", f"gconf_del_{gid}".encode())],

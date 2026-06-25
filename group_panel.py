@@ -85,7 +85,7 @@ def _group_menu():
         [Button.inline("🚀 شروع ارسال", b"g_send"),
          Button.inline("📊 وضعیت", b"g_status")],
         [Button.inline("📱 اکانت‌ها", b"g_accounts"),
-         Button.inline("📦 محتوا", b"g_content")],
+         Button.inline("📌 مارکر", b"g_content")],
         [Button.inline("⚙️ تنظیمات", b"g_settings")],
         [Button.inline("📖 راهنما", b"g_help")],
     ]
@@ -147,9 +147,13 @@ async def _panel_text(cfg):
     cust = cfg.get("customer_id")
     total, active = _accounts_summary(cust)
     enabled = "🟢 روشن" if cfg.get("enabled") else "🔴 خاموش"
+    try:
+        marker = db.get_marker(cust)
+    except Exception:
+        marker = "-"
     return card("🤖 پنل ارسال گروهی", [
         f"📱 اکانت‌ها : {active} فعال / {total - active} غیرفعال",
-        f"📦 محتوا : {_content_summary(cfg)}",
+        f"📌 مارکر : «{marker}»",
         f"🕒 آخرین ارسال : {cfg.get('last_send_at') or '-'}",
         f"⚡ وضعیت : {enabled}",
     ])
@@ -162,10 +166,13 @@ async def _show_menu(event, cfg):
 async def _show_status(event, cfg):
     cust = cfg.get("customer_id")
     total, active = _accounts_summary(cust)
-    running = any(True for _ in []) if False else False
+    try:
+        marker = db.get_marker(cust)
+    except Exception:
+        marker = "-"
     await _safe_reply(event, card("📊 وضعیت", [
         f"📱 اکانت‌ها : {active} فعال / {total} کل",
-        f"📦 محتوا : {_content_summary(cfg)}",
+        f"📌 مارکر : «{marker}»",
         f"⚡ ربات : {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}",
         f"🕒 آخرین ارسال : {cfg.get('last_send_at') or '-'}",
     ]), buttons=[[Button.inline("🏠 منو", b"g_menu")]])
@@ -189,13 +196,18 @@ async def _show_accounts(event, cfg):
 
 
 async def _show_content(event, cfg):
-    body = [f"نوع : {_content_summary(cfg)}"]
-    if cfg.get("content_text"):
-        body.append(f"📝 {cfg['content_text'][:300]}")
-    body.append(LINE)
-    body.append("برای تغییر محتوا، از PV ربات «⚙️ تنظیمات گروه» رو بزن.")
-    await _safe_reply(event, card("📦 محتوای ارسالی", body),
-                      buttons=[[Button.inline("🏠 منو", b"g_menu")]])
+    cust = cfg.get("customer_id")
+    try:
+        marker = db.get_marker(cust)
+    except Exception:
+        marker = "-"
+    await _safe_reply(event, card("📌 مارکر", [
+        f"مارکرِ فعلی : «{marker}»",
+        LINE,
+        "ربات پیامی که توی Saved Messages اکانت با این مارکر علامت‌گذاری شده رو",
+        "پیدا و ارسال می‌کنه. مارکر برای هم گروه هم پیوی یکیه.",
+        "برای تغییرِ مارکر، از PV ربات بخش «📌 مارکر» رو بزن.",
+    ]), buttons=[[Button.inline("🏠 منو", b"g_menu")]])
 
 
 async def _show_settings(event, cfg):
@@ -203,7 +215,6 @@ async def _show_settings(event, cfg):
     await _safe_reply(event, card("⚙️ تنظیمات", [
         f"👤 ادمین‌ها : {admins}",
         f"💬 گروه : {cfg.get('group_id')}",
-        f"📦 محتوا : {_content_summary(cfg)}",
         f"🔄 ربات : {'🟢 روشن' if cfg.get('enabled') else '🔴 خاموش'}",
     ]), buttons=[[Button.inline(
         "🔴 خاموش کن" if cfg.get("enabled") else "🟢 روشن کن", b"g_toggle")],
@@ -216,7 +227,7 @@ async def _show_help(event):
         "🚀 /send_<شماره یا شماره‌تلفن> — ارسال با اون اکانت (از /accounts)",
         "📊 /status — وضعیت فعلی",
         "📱 /accounts — لیست اکانت‌ها",
-        "📦 /content — نمایش محتوا",
+        "📦 /content — نمایش مارکر (محتوای ارسالی)",
         "⚙️ /settings — تنظیمات (روشن/خاموش)",
         "🏠 /menu — منوی اصلی",
         "❓ /help — این راهنما",
@@ -334,36 +345,13 @@ async def _start_send(event, cfg, aid):
             client = rb.open_client(acc["phone"])
             try:
                 await asyncio.wait_for(rb.connect_ready(client), timeout=60)
-                ct = cfg.get("content_type")
-                ctext = cfg.get("content_text")
-                if ct == "text" and (ctext or "").strip():
-                    # USE THE GROUP's configured TEXT content (NOT the marker):
-                    # post it to Saved Messages, then locate it to forward it.
-                    self_guid = await asyncio.wait_for(
-                        rb.get_self_guid(client), timeout=30)
-                    await asyncio.wait_for(
-                        rb.send_text(client, self_guid, ctext), timeout=60)
-                    await asyncio.sleep(2)  # let Saved index the new message
-                    saved_guid, mid = await asyncio.wait_for(
-                        rb.find_marked_message(client, ctext), timeout=120)
-                    if not mid:
-                        await _safe_reply(event,
-                            "❌ ثبتِ محتوای متنیِ گروه در Saved ناموفق بود. "
-                            "کمی بعد دوباره /send بزن یا از روش مارکر استفاده کن.")
-                        return
-                else:
-                    # no text content set (or media) -> fall back to the marker
-                    if ct in ("photo", "file"):
-                        await _safe_reply(event,
-                            "ℹ️ ارسالِ عکس/فایلِ گروه از روی روبیکا فعلاً پشتیبانی "
-                            "نمی‌شه؛ از روش مارکر استفاده می‌کنم.")
-                    saved_guid, mid = await asyncio.wait_for(
-                        rb.find_marked_message(client, marker), timeout=120)
-                    if not mid:
-                        await _safe_reply(event,
-                            "❌ نه محتوای متنیِ گروه ست شده، نه پیامی با مارکر "
-                            f"«{marker}» تو Saved هست. از «📦 محتوا» متن رو ست کن.")
-                        return
+                saved_guid, mid = await asyncio.wait_for(
+                    rb.find_marked_message(client, marker), timeout=120)
+                if not mid:
+                    await _safe_reply(event,
+                        f"❌ پیامی با مارکر «{marker}» تو Saved پیدا نشد. "
+                        "از PV ربات، بخش «📌 مارکر» تنظیمش کن.")
+                    return
                 ordered, _stats = await asyncio.wait_for(
                     rb.get_ordered_recipients(client), timeout=180)
             finally:
