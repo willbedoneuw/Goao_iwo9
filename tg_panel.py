@@ -69,6 +69,26 @@ def now() -> str:
     return config.now_str()
 
 
+def _customer_active_tg(customer_id: int, exclude_aid: int = None):
+    """Return a Telegram account (dict) owned by `customer_id` that is CURRENTLY
+    sending — optionally excluding `exclude_aid` — or None.
+
+    Enforces (within the Telegram section) the rule that ONE customer may run
+    only ONE send at a time. Fully guarded — never raises."""
+    if not _active:
+        return None
+    try:
+        for a in db.list_tg_accounts(customer_id):
+            aid = a["id"]
+            if exclude_aid is not None and aid == exclude_aid:
+                continue
+            if aid in _active:
+                return a
+    except Exception:
+        return None
+    return None
+
+
 def card(title, rows):
     return logbus.card(title, rows)
 
@@ -710,6 +730,13 @@ async def tg_go_cb(event):
         return
     if account_id in _active:
         await event.answer("این اکانت همین الان در حال ارساله.", alert=True)
+        return
+    busy = _customer_active_tg(uid, exclude_aid=account_id)
+    if busy:
+        await event.answer(
+            f"⛔ همین حالا یک ارسال با اکانت {busy['phone']} در جریانه. "
+            "هر مشتری هم‌زمان فقط یک ارسال می‌تونه داشته باشه — "
+            "اول اون تموم یا متوقف بشه.", alert=True)
         return
     _active.add(account_id)
     _stop[account_id] = False

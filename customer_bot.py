@@ -76,6 +76,28 @@ def card(title, rows):
     return logbus.card(title, rows)
 
 
+def customer_active_account(customer_id: int, exclude_aid: int = None):
+    """Return an account (dict) owned by `customer_id` that is CURRENTLY running
+    a send job — optionally excluding `exclude_aid` — or None.
+
+    Enforces the rule: ONE customer may run only ONE send at a time. A customer
+    sending from two different accounts at once would put two simultaneous
+    Rubika sessions in flight for the same person, which we don't allow.
+    Fully guarded — a failure here must never block a legitimate send."""
+    if not active_jobs:
+        return None
+    try:
+        for a in db.list_accounts(customer_id):
+            aid = a["id"]
+            if exclude_aid is not None and aid == exclude_aid:
+                continue
+            if aid in active_jobs:
+                return a
+    except Exception:
+        return None
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Subscription / access helpers.
 # --------------------------------------------------------------------------- #
@@ -1435,6 +1457,13 @@ async def send_prepare_cb(event):
     if aid in active_jobs:
         await event.answer("یک ارسال روی این اکانت در حال اجراست.", alert=True)
         return
+    busy = customer_active_account(uid, exclude_aid=aid)
+    if busy:
+        await event.answer(
+            f"⛔ همین حالا یک ارسال با اکانت {busy['phone']} در جریانه. "
+            "هر مشتری هم‌زمان فقط یک ارسال می‌تونه داشته باشه — "
+            "اول اون تموم یا متوقف بشه.", alert=True)
+        return
     marker = db.get_marker(uid)
     await _respond(event, f"⏳ پیدا کردن پیامِ نشان‌دار «{marker}» و آماده‌سازی لیست ...")
 
@@ -1521,9 +1550,22 @@ async def send_go_cb(event):
     if aid in active_jobs:
         await event.answer("ارسال در حال اجراست.", alert=True)
         return
+    busy = customer_active_account(event.sender_id, exclude_aid=aid)
+    if busy:
+        await event.answer(
+            f"⛔ همین حالا یک ارسال با اکانت {busy['phone']} در جریانه. "
+            "هر مشتری هم‌زمان فقط یک ارسال می‌تونه داشته باشه — "
+            "اول اون تموم یا متوقف بشه.", alert=True)
+        return
+    # RESERVE this account NOW — the check above + this add happen with NO await
+    # in between, so two rapid starts (on this OR another account of the same
+    # customer) can't both pass the guard. run_send re-adds it idempotently and
+    # owns its release in its finally; _safe_launch_send guarantees release even
+    # if run_send raises before reaching its own finally.
+    active_jobs.add(aid)
     await _respond(event, "🚀 ارسال شروع شد. گزارش همین‌جا برات میاد.",
                    buttons=[[Button.inline("⛔ توقف", f"sendstop_{aid}".encode())]])
-    asyncio.create_task(run_send(payload))
+    asyncio.create_task(_safe_launch_send(payload))
 
 
 @bot.on(events.CallbackQuery(pattern=b"sendstop_(\\d+)"))
@@ -1548,6 +1590,26 @@ async def _wait_or_stop(account_id: int, seconds: float, step: float = 2.0) -> b
         await asyncio.sleep(d)
         waited += d
     return False
+
+
+async def _safe_launch_send(payload: dict):
+    """Launch run_send so the per-account reservation in active_jobs is ALWAYS
+    released — even if run_send raises before reaching its own finally. run_send
+    discards the reservation itself in the normal flow; this is the safety net."""
+    account_id = payload.get("account_id")
+    try:
+        await run_send(payload)
+    except Exception as e:  # noqa: BLE001
+        try:
+            await logbus.to_group(card("❌ SEND LAUNCH ERROR", [
+                f"🆔 {payload.get('customer_id')}",
+                f"📱 {payload.get('phone')}",
+                f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
+        except Exception:
+            pass
+    finally:
+        if account_id is not None:
+            active_jobs.discard(account_id)
 
 
 async def run_send(payload: dict):
@@ -2634,7 +2696,8 @@ async def amain():
     tg_panel.setup(bot, state)   # register the decoupled Telegram section
     bale_panel.setup(bot, state, tg_panel._state)   # decoupled Bale section
     group_panel.setup(bot, run_send=run_send, active_jobs=active_jobs,
-                      stop_flags=stop_flags, pending_send=pending_send)
+                      stop_flags=stop_flags, pending_send=pending_send,
+                      customer_active_account=customer_active_account)
     await logbus.to_group(card("🤖 CUSTOMER BOT ONLINE", [
         f"🏷 Version : {config.VERSION}", f"🕒 {now()}"]))
     asyncio.create_task(expiry_loop())

@@ -38,6 +38,7 @@ _run_send = None          # customer_bot.run_send reference
 _active_jobs = None       # customer_bot.active_jobs set (per-account guard)
 _stop_flags = None        # customer_bot.stop_flags dict
 _pending_send = None      # customer_bot.pending_send dict
+_customer_active_account = None  # customer_bot.customer_active_account (per-customer guard)
 
 # Rubika/Telegram/Bale modules (imported lazily in setup so import stays light)
 rb = worker = account_conn = None
@@ -323,6 +324,21 @@ async def _start_send(event, cfg, aid):
         await _safe_reply(event, "یک ارسال روی این اکانت در حال اجراست.",
                           buttons=[[Button.inline("⛔ توقف", b"g_stop")]])
         return
+    # one customer = one concurrent send: reject if ANY other account of this
+    # customer is already sending (checked right before the atomic reserve, no
+    # await in between, so two rapid /send on different accounts can't race).
+    if _customer_active_account is not None:
+        try:
+            busy = _customer_active_account(cust, exclude_aid=aid)
+        except Exception:
+            busy = None
+        if busy:
+            await _safe_reply(event,
+                f"⛔ همین حالا یک ارسال با اکانت {busy['phone']} در جریانه. "
+                "هر مشتری هم‌زمان فقط یک ارسال می‌تونه داشته باشه — "
+                "اول اون تموم یا متوقف بشه.",
+                buttons=[[Button.inline("⛔ توقف", b"g_stop")]])
+            return
     # RESERVE the account NOW — atomic (no await between the check above and this
     # add). Without it, two rapid /send on the same account would BOTH pass the
     # check (run_send adds active_jobs only later) and open TWO connections to
@@ -566,17 +582,19 @@ async def _chat_action_router(event):
 # Wiring
 # --------------------------------------------------------------------------- #
 def setup(shared_bot, run_send=None, active_jobs=None, stop_flags=None,
-          pending_send=None):
+          pending_send=None, customer_active_account=None):
     """Register group handlers. Called once from customer_bot.amain().
     run_send/active_jobs/stop_flags/pending_send are customer_bot references
     (so we REUSE the proven send engine instead of duplicating it)."""
     global bot, _run_send, _active_jobs, _stop_flags, _pending_send
+    global _customer_active_account
     global rb, worker, account_conn
     bot = shared_bot
     _run_send = run_send
     _active_jobs = active_jobs
     _stop_flags = stop_flags
     _pending_send = pending_send
+    _customer_active_account = customer_active_account
 
     import rubika_client as _rb
     import worker as _w
