@@ -131,6 +131,16 @@ async def _gate(event) -> bool:
     uid = event.sender_id
     if db.is_blocked(uid):
         return False
+    # --- Bale section is TEMPORARILY DISABLED ---
+    # Every Bale action goes through _gate, so short-circuiting here disables the
+    # whole section (menu / send / add / health / content). It never touches
+    # aiobale, so it can't block or crash the bot.
+    await _respond(event, card("🔵 بخش بله", [
+        "⚠️ بخش بله موقتاً غیرفعاله.",
+        "بعداً دوباره فعال می‌شه — ممنون از صبرت.",
+    ]))
+    return False
+    # (everything below is intentionally unreachable while disabled)
     user = await event.get_sender()
     name = getattr(user, "first_name", "") or ""
     username = getattr(user, "username", "") or ""
