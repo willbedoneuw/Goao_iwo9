@@ -213,7 +213,7 @@ async def _respond(event, text, buttons=None):
 # --------------------------------------------------------------------------- #
 # /start
 # --------------------------------------------------------------------------- #
-@bot.on(events.NewMessage(pattern="/start"))
+@bot.on(events.NewMessage(pattern="/start", func=lambda e: e.is_private))
 async def start_handler(event):
     uid = event.sender_id
     # Blocked users are fully ignored: no reply, no log, no processing (anti-spam).
