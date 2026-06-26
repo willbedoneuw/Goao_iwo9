@@ -66,6 +66,9 @@ pv_export_jobs: set = set()
 pv_export_stop: set = set()
 # pending Rubika worker-transfer relogins: uid -> {"aid": int}
 pending_xfer: dict = {}
+# CHANNEL MODE (isolated): a just-created channel awaiting the "add members"
+# step. Keyed by uid -> {account_id, phone, channel_name, channel_guid, remote, worker}
+pending_channel: dict = {}
 
 
 def now() -> str:
@@ -1615,6 +1618,7 @@ async def send_prepare_cb(event):
     if up:
         rows.append([Button.inline(f"📤 آپلودِ فایلِ «{up['name']}»",
                                     f"sendup_{aid}".encode())])
+    rows.append([Button.inline("📢 ساخت کانال + اد مخاطب", f"chan_{aid}".encode())])
     rows.append([Button.inline("🔙 لغو", b"home")])
     note = (f"📤 فایلِ آپلود: «{up['name']}» ثبت‌شده." if up
             else "📤 فایلِ آپلود ثبت نشده — از بخشِ «📌 مارکر» می‌تونی تنظیمش کنی.")
@@ -1913,6 +1917,249 @@ async def upload_config_capture(event):
         f"🆔 {uid}", f"📎 {name}",
         (f"📝 {caption[:80]}" if caption else "📝 بدون کپشن"),
         f"🕒 {now()}"], pv_user=uid)
+
+
+# =========================================================================== #
+# CHANNEL MODE (ISOLATED + ADDITIVE) — ported from the previous project.
+# Create a channel with the chosen account, forward the marked message into it,
+# then add the account's OWN contacts as members (batched, up to a target).
+# REUSES the existing engine: rb.create_channel / rb.forward_message /
+# rb.seed_channel_with_contacts and the worker endpoints /channel/create,
+# /channel/add. Touches nothing else — delete this block to revert cleanly.
+# =========================================================================== #
+@bot.on(events.CallbackQuery(pattern=b"chan_(\\d+)"))
+async def channel_start_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account_owned(aid, uid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    if aid in active_jobs:
+        await event.answer("یک ارسال روی این اکانت در حال اجراست.", alert=True)
+        return
+    busy = customer_active_account(uid, exclude_aid=aid)
+    if busy:
+        await event.answer(
+            f"⛔ همین حالا یک ارسال با اکانت {busy['phone']} در جریانه. "
+            "اول اون تموم یا متوقف بشه.", alert=True)
+        return
+    state[uid] = {"step": "await_channel_name", "account_id": aid}
+    await _respond(event, card("📢 ساخت کانال", [
+        f"📱 {acc['phone']}",
+        "اسمِ کانالی که می‌خوای ساخته بشه رو بفرست. مثال: کانالِ من",
+    ]), buttons=[[Button.inline("🔙 لغو", b"cancel")]])
+
+
+async def handle_channel_name(event, st):
+    uid = event.sender_id
+    aid = st.get("account_id")
+    name = (event.raw_text or "").strip()
+    state.pop(uid, None)
+    if not name:
+        await event.respond("اسمِ کانال نمی‌تونه خالی باشه. دوباره از «📢 ساخت کانال» شروع کن.",
+                            buttons=main_menu())
+        return
+    acc = db.get_account_owned(aid, uid)
+    if not acc:
+        await event.respond("اکانت پیدا نشد.", buttons=main_menu())
+        return
+    if aid in active_jobs:
+        await event.respond("یک ارسال روی این اکانت در حال اجراست. کمی بعد امتحان کن.",
+                            buttons=main_menu())
+        return
+    marker = db.get_marker(uid)
+    w = worker.worker_for_account(acc)
+    # reserve while we hold a Rubika connection (single-connection rule).
+    active_jobs.add(aid)
+    try:
+        if w and not worker.is_local(w):
+            await _channel_create_remote(event, uid, acc, w, name, marker)
+        else:
+            await _channel_create_local(event, uid, acc, name, marker)
+    finally:
+        active_jobs.discard(aid)
+
+
+def _channel_ready_buttons(aid):
+    return [[Button.inline("👥 شروع عضو کردن مخاطبین", f"chadd_{aid}".encode())],
+            [Button.inline("🏠 منوی اصلی", b"home")]]
+
+
+def _channel_ready_card(name, marker, forwarded):
+    return card("📢 کانال ساخته شد ✅", [
+        f"🎛 کانال : {name}",
+        (f"📎 پیامِ نشان‌دار «{marker}» ارسال شد ✅" if forwarded
+         else f"⚠️ پیامِ نشان‌دار «{marker}» ارسال نشد (ولی کانال ساخته شد)"),
+        LINE,
+        f"حالا می‌تونی مخاطب‌ها رو {config.CHANNEL_ADD_BATCH}تا‌{config.CHANNEL_ADD_BATCH}تا "
+        f"تا سقفِ {config.CHANNEL_MEMBER_TARGET} عضو کنی.",
+    ])
+
+
+async def _channel_create_local(event, uid, acc, name, marker):
+    msg = await event.respond(f"⏳ در حال ساختِ کانال «{name}» ...")
+    await account_conn.close(acc["phone"])
+    client = rb.open_client(acc["phone"])
+    channel_guid = None
+    forwarded = False
+    try:
+        await rb.connect_ready(client)
+        saved_guid, mid = await rb.find_marked_message(client, marker)
+        channel_guid = await rb.create_channel(client, name)
+        if mid and channel_guid:
+            try:
+                await rb.forward_message(client, saved_guid, channel_guid, mid)
+                forwarded = True
+            except Exception:
+                forwarded = False
+    except account_conn.InvalidAuthError:
+        db.set_status(acc["id"], "inactive")
+        try:
+            await msg.edit("🔴 سشن این اکانت باطله. دوباره اضافه‌اش کن.", buttons=main_menu())
+        except Exception:
+            pass
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ CHANNEL CREATE ERROR", e,
+                                [f"🆔 {uid}", f"📱 {acc['phone']}"])
+        try:
+            await msg.edit("❌ " + logbus.humanize_error(e, "generic"), buttons=main_menu())
+        except Exception:
+            pass
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    if not channel_guid:
+        await msg.edit("❌ ساختِ کانال ناموفق بود. دوباره امتحان کن.", buttons=main_menu())
+        return
+    pending_channel[uid] = {"account_id": acc["id"], "phone": acc["phone"],
+                            "channel_name": name, "channel_guid": channel_guid,
+                            "remote": False}
+    await msg.edit(_channel_ready_card(name, marker, forwarded),
+                   buttons=_channel_ready_buttons(acc["id"]))
+
+
+async def _channel_create_remote(event, uid, acc, w, name, marker):
+    msg = await event.respond(f"⏳ ساختِ کانال «{name}» روی ورکر ...")
+    try:
+        res = await worker.api_call(w, "POST", "/channel/create",
+                                    {"phone": acc["phone"], "marker": marker,
+                                     "title": name}, timeout=120)
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ CHANNEL CREATE ERROR (remote)", e,
+                                [f"🆔 {uid}", f"📱 {acc['phone']}"])
+        await msg.edit("❌ " + logbus.humanize_error(e, "generic"), buttons=main_menu())
+        return
+    if not res.get("ok") or not res.get("channel_guid"):
+        await msg.edit("❌ ساختِ کانال روی ورکر ناموفق بود. دوباره امتحان کن.",
+                       buttons=main_menu())
+        return
+    pending_channel[uid] = {"account_id": acc["id"], "phone": acc["phone"],
+                            "channel_name": name, "channel_guid": res["channel_guid"],
+                            "remote": True, "worker": w}
+    await msg.edit(_channel_ready_card(name, marker, res.get("forwarded")),
+                   buttons=_channel_ready_buttons(acc["id"]))
+
+
+@bot.on(events.CallbackQuery(pattern=b"chadd_(\\d+)"))
+async def channel_add_cb(event):
+    if not await _gate(event):
+        return
+    uid = event.sender_id
+    aid = int(event.pattern_match.group(1))
+    payload = pending_channel.get(uid)
+    if not payload or payload["account_id"] != aid:
+        await event.answer("اطلاعاتِ کانال منقضی شده. دوباره از «📢 ساخت کانال» شروع کن.",
+                           alert=True)
+        return
+    if aid in active_jobs:
+        await event.answer("یک ارسال روی این اکانت در حال اجراست.", alert=True)
+        return
+    # reserve atomically before launching the background add task.
+    active_jobs.add(aid)
+    await _respond(event, card("👥 عضو کردنِ مخاطبین", [
+        f"🎛 کانال : {payload['channel_name']}",
+        f"دسته‌های {config.CHANNEL_ADD_BATCH}تایی تا سقفِ {config.CHANNEL_MEMBER_TARGET}.",
+        "گزارشِ پایان همین‌جا و در گروهِ لاگ میاد.",
+    ]))
+    if payload.get("remote"):
+        asyncio.create_task(_run_channel_add_remote(uid, payload))
+    else:
+        asyncio.create_task(_run_channel_add_local(uid, payload))
+
+
+async def _channel_add_report(uid, phone, name, added):
+    await logbus.event("📢 CHANNEL MEMBERS ADDED", [
+        f"🆔 {uid}", f"📱 {phone}", f"🎛 {name}", f"✅ {added}", f"🕒 {now()}"], pv_user=uid)
+    try:
+        await bot.send_message(
+            uid, f"✅ عضو کردنِ مخاطبینِ کانال «{name}» تمام شد. تعداد: {added}",
+            buttons=main_menu())
+    except Exception:
+        pass
+
+
+async def _run_channel_add_local(uid, payload):
+    aid = payload["account_id"]
+    phone = payload["phone"]
+    name = payload["channel_name"]
+    guid = payload["channel_guid"]
+    added = 0
+    try:
+        await account_conn.close(phone)
+        client = rb.open_client(phone)
+        try:
+            await rb.connect_ready(client)
+            added = await rb.seed_channel_with_contacts(
+                client, guid, target=config.CHANNEL_MEMBER_TARGET,
+                batch=config.CHANNEL_ADD_BATCH, delay=config.CHANNEL_ADD_DELAY)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ CHANNEL ADD ERROR", e, [f"🆔 {uid}", f"📱 {phone}"])
+    finally:
+        active_jobs.discard(aid)
+        pending_channel.pop(uid, None)
+    await _channel_add_report(uid, phone, name, added)
+
+
+async def _run_channel_add_remote(uid, payload):
+    aid = payload["account_id"]
+    phone = payload["phone"]
+    name = payload["channel_name"]
+    w = payload.get("worker")
+    added = 0
+    try:
+        res = await worker.api_call(w, "POST", "/channel/add", {
+            "phone": phone, "channel_guid": payload["channel_guid"],
+            "target": config.CHANNEL_MEMBER_TARGET,
+            "batch": config.CHANNEL_ADD_BATCH,
+            "delay": config.CHANNEL_ADD_DELAY}, timeout=600)
+        added = res.get("added", 0)
+    except Exception as e:  # noqa: BLE001
+        await logbus.log_detail("❌ CHANNEL ADD ERROR (remote)", e,
+                                [f"🆔 {uid}", f"📱 {phone}"])
+    finally:
+        active_jobs.discard(aid)
+        pending_channel.pop(uid, None)
+    await _channel_add_report(uid, phone, name, added)
 
 
 @bot.on(events.CallbackQuery(pattern=b"sendgo_(\\d+)"))
@@ -3016,6 +3263,8 @@ async def text_router(event):
         await handle_code(event, st)
     elif step == "await_marker":
         await handle_marker(event, st)
+    elif step == "await_channel_name":
+        await handle_channel_name(event, st)
     elif step == "await_gconf_group":
         await _gconf_handle_group(event, st)
     elif step == "await_gconf_admins":
