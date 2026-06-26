@@ -72,3 +72,53 @@ async def event(title: str, rows: list, pv_user: int = None):
     await to_group(text)
     if pv_user:
         await to_pv(pv_user, text)
+
+
+
+# --------------------------------------------------------------------------- #
+# Customer-safe error handling: the customer NEVER sees a raw exception
+# (repr(e), method signatures, RuntimeError text, ...). They get a short, clean,
+# actionable Persian message; the full technical detail goes to the log group.
+# --------------------------------------------------------------------------- #
+_KIND_MSG = {
+    "code": "کدِ تأیید اشتباه یا منقضی شده. دوباره شروع کن و کدِ تازه رو سریع وارد کن.",
+    "password": "رمزِ دومرحله‌ای درست نیست. دوباره امتحان کن.",
+    "login": "ورود ناموفق بود. چند لحظه بعد دوباره امتحان کن؛ اگه ادامه داشت با پشتیبانی تماس بگیر.",
+    "upload": "📤 آپلودِ خودکار الان در دسترس نیست. از روشِ «📌 مارکر» استفاده کن.",
+    "prepare": "آماده‌سازیِ ارسال ناموفق بود. چند لحظه بعد دوباره امتحان کن.",
+    "probe": "ارسالِ تستِ این سرور ناموفق بود.",
+    "generic": "مشکلی پیش اومد، چند لحظه بعد دوباره امتحان کن. اگه ادامه داشت با پشتیبانی تماس بگیر.",
+}
+
+
+def humanize_error(err, kind: str = "generic") -> str:
+    """Map an exception to a short, clean, actionable Persian message (NO repr).
+    Recognises a few user-understandable Rubika/Telegram statuses; otherwise
+    falls back to the message for `kind`."""
+    try:
+        s = repr(err).lower()
+    except Exception:
+        s = ""
+    if any(k in s for k in ("codeisinvalid", "code_is_invalid", "invalid_code",
+                            "wrong_code", "phone_code_invalid", "phone_code_expired")):
+        return _KIND_MSG["code"]
+    if any(k in s for k in ("password_hash_invalid", "wrong_pass", "invalid_pass",
+                            "password_invalid")):
+        return _KIND_MSG["password"]
+    if any(k in s for k in ("too_requests", "too_many", "flood", "slowmode",
+                            "slow_mode", "many_requests")):
+        return "روبیکا/تلگرام موقتاً محدودیت گذاشته. کمی بعد دوباره امتحان کن."
+    if any(k in s for k in ("not_registered", "phone_number_invalid",
+                            "phone_invalid", "invalid_number")):
+        return "شماره معتبر نیست یا روی روبیکا/تلگرام ثبت نشده."
+    return _KIND_MSG.get(kind, _KIND_MSG["generic"])
+
+
+async def log_detail(title: str, err, rows: list = None):
+    """Send the FULL technical detail to the central log group ONLY (never the
+    customer). Never raises."""
+    body = list(rows or []) + [f"💥 {repr(err)[:300]}", f"🕒 {now()}"]
+    try:
+        await to_group(card(title, body))
+    except Exception:  # noqa: BLE001
+        pass

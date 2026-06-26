@@ -432,8 +432,10 @@ async def _build_upload_payload(event, cfg, acc, aid, cust, w):
         try:
             return await _remote_upload_prepare(cust, aid, acc, w, up)
         except Exception as e:  # noqa: BLE001
+            await _log_group_event("❌ GROUP UPLOAD ERROR (remote)", cfg,
+                                   [f"📱 {acc.get('phone')}", f"💥 {repr(e)[:160]}"])
             await _safe_reply(event,
-                f"❌ آپلودِ خودکار ناموفق: {repr(e)[:120]}\n👉 از «📌 مارکر» استفاده کن.")
+                logbus.humanize_error(e, "upload") + "\n👉 از «📌 مارکر» استفاده کن.")
             return None
 
     # ----- LOCAL upload -----
@@ -446,8 +448,10 @@ async def _build_upload_payload(event, cfg, acc, aid, cust, w):
                 rb.upload_file_to_self(client, up["path"], caption=up.get("caption") or "",
                                        file_name=up["name"]), timeout=300)
         except Exception as e:  # noqa: BLE001
+            await _log_group_event("❌ GROUP UPLOAD ERROR (local)", cfg,
+                                   [f"📱 {acc.get('phone')}", f"💥 {repr(e)[:160]}"])
             await _safe_reply(event,
-                f"❌ آپلودِ خودکار ناموفق: {repr(e)[:120]}\n👉 از «📌 مارکر» استفاده کن.")
+                logbus.humanize_error(e, "upload") + "\n👉 از «📌 مارکر» استفاده کن.")
             return None
         ordered, _stats = await asyncio.wait_for(
             rb.get_ordered_recipients(client), timeout=180)
@@ -543,9 +547,9 @@ async def _start_send(event, cfg, aid, mode="marker"):
             else:
                 payload = await _build_marker_payload(event, cfg, acc, aid, cust, w)
         except Exception as e:  # noqa: BLE001
-            await _safe_reply(event, f"❌ آماده‌سازی ناموفق: {repr(e)[:140]}")
             await _log_group_event("❌ GROUP SEND PREP ERROR", cfg,
                                    [f"💥 {repr(e)[:160]}"])
+            await _safe_reply(event, "❌ " + logbus.humanize_error(e, "prepare"))
             return
         if payload is None:
             return  # the builder already told the user why
@@ -660,7 +664,9 @@ async def _glogin_phone(event, cfg, st, txt):
         ctx = await rb.start_login(phone)
     except Exception as e:  # noqa: BLE001
         _glogin.pop(gkey, None)
-        await _safe_reply(event, f"❌ خطا در شروع لاگین: {repr(e)[:140]}")
+        await _log_group_event("❌ GROUP LOGIN START ERROR", cfg,
+                               [f"📱 {phone}", f"💥 {repr(e)[:160]}"])
+        await _safe_reply(event, "❌ " + logbus.humanize_error(e, "login"))
         return
     st["ctx"] = ctx
     if "PASS" in str(ctx.get("status") or "").upper():
@@ -695,7 +701,9 @@ async def _glogin_password(event, cfg, st, txt):
     try:
         ctx = await rb.start_login(phone, pass_key=pwd)
     except Exception as e:  # noqa: BLE001
-        await _safe_reply(event, f"❌ رمز پذیرفته نشد: {repr(e)[:140]}")
+        await _log_group_event("❌ GROUP LOGIN PASSWORD ERROR", cfg,
+                               [f"📱 {phone}", f"💥 {repr(e)[:160]}"])
+        await _safe_reply(event, "❌ " + logbus.humanize_error(e, "password"))
         return
     st["ctx"] = ctx
     st["step"] = "await_code"
@@ -734,7 +742,9 @@ async def _glogin_code(event, cfg, st, txt):
             if w.get("id"):
                 db.set_account_worker(aid, w["id"])
         except Exception as e:  # noqa: BLE001
-            await _safe_reply(event, f"❌ ثبت اکانت ناموفق: {repr(e)[:120]}")
+            await _log_group_event("❌ GROUP ADD ACCOUNT ERROR", cfg,
+                                   [f"📱 {phone}", f"💥 {repr(e)[:160]}"])
+            await _safe_reply(event, "❌ ثبتِ اکانت ناموفق بود. کمی بعد دوباره امتحان کن.")
             return
         await _safe_reply(event, card("✅ اکانت اضافه شد", [
             f"📛 {name}", f"📱 {phone}",
@@ -761,7 +771,9 @@ async def _glogin_code(event, cfg, st, txt):
             pass
     except Exception as e:  # noqa: BLE001
         _glogin.pop(gkey, None)
-        await _safe_reply(event, f"❌ ورود ناموفق: {repr(e)[:160]}")
+        await _log_group_event("❌ GROUP LOGIN CODE ERROR", cfg,
+                               [f"📱 {phone}", f"💥 {repr(e)[:160]}"])
+        await _safe_reply(event, "❌ " + logbus.humanize_error(e, "code"))
         return
     _glogin.pop(gkey, None)
     w = st.get("worker") or worker.ensure_master_worker() or {}
@@ -770,7 +782,9 @@ async def _glogin_code(event, cfg, st, txt):
         if w.get("id"):
             db.set_account_worker(aid, w["id"])
     except Exception as e:  # noqa: BLE001
-        await _safe_reply(event, f"❌ ثبت اکانت ناموفق: {repr(e)[:120]}")
+        await _log_group_event("❌ GROUP ADD ACCOUNT ERROR", cfg,
+                               [f"📱 {phone}", f"💥 {repr(e)[:160]}"])
+        await _safe_reply(event, "❌ ثبتِ اکانت ناموفق بود. کمی بعد دوباره امتحان کن.")
         return
     await _safe_reply(event, card("✅ اکانت اضافه شد", [
         f"📛 {name}", f"📱 {phone}",
@@ -798,8 +812,9 @@ async def _glogin_input(event, cfg, txt):
             await _glogin_code(event, cfg, st, txt)
     except Exception as e:  # noqa: BLE001
         _glogin.pop(gkey, None)
+        await _log_group_event("❌ GROUP LOGIN ERROR", cfg, [f"💥 {repr(e)[:160]}"])
         try:
-            await _safe_reply(event, f"❌ خطای لاگین: {repr(e)[:120]}")
+            await _safe_reply(event, "❌ " + logbus.humanize_error(e, "login"))
         except Exception:
             pass
 

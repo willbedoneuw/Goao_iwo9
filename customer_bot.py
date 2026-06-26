@@ -895,7 +895,8 @@ async def handle_phone(event, st):
     except Exception as e:  # noqa: BLE001
         state.pop(uid, None)
         pending_xfer.pop(uid, None)
-        await msg.edit(f"❌ خطا در شروع لاگین: {repr(e)[:140]}", buttons=main_menu())
+        await logbus.log_detail("❌ LOGIN START ERROR", e, [f"🆔 {uid}", f"📱 {phone}"])
+        await msg.edit("❌ " + logbus.humanize_error(e, "login"), buttons=main_menu())
         return
     status = str(ctx.get("status") or "").upper()
     pending_login[uid] = ctx
@@ -942,7 +943,8 @@ async def handle_password(event, st):
     try:
         ctx = await rb.start_login(phone, pass_key=pwd)
     except Exception as e:  # noqa: BLE001
-        await msg.edit(f"❌ رمز پذیرفته نشد: {repr(e)[:140]}")
+        await logbus.log_detail("❌ LOGIN PASSWORD ERROR", e, [f"🆔 {uid}", f"📱 {phone}"])
+        await msg.edit("❌ " + logbus.humanize_error(e, "password"))
         return
     pending_login[uid] = ctx
     st["step"] = "await_code"
@@ -1019,7 +1021,8 @@ async def handle_code(event, st):
         except Exception:
             pass
     except Exception as e:  # noqa: BLE001
-        await msg.edit(f"❌ ورود ناموفق: {repr(e)[:160]}")
+        await logbus.log_detail("❌ LOGIN CODE ERROR", e, [f"🆔 {uid}", f"📱 {phone}"])
+        await msg.edit("❌ " + logbus.humanize_error(e, "code"))
         pending_xfer.pop(uid, None)
         return
     finally:
@@ -1215,16 +1218,17 @@ async def _rubika_post_add(uid, aid, phone, w):
             f"🕒 {now()}"], pv_user=uid)
     else:
         reason = (f"🚫 {too} بار TOO_REQUESTS" if too
-                  else f"💥 {err or 'ارسال ناموفق'}")
+                  else "💥 ارسالِ تستِ این سرور ناموفق بود")
         text = card("⚠️ ارسالِ این سرور مشکل داره", [
             f"📱 {phone}", reason,
             "احتمالاً محدودیتِ آی‌پیِ این سرور. می‌تونی اکانت رو به ورکر دیگه "
             "منتقل کنی و دوباره لاگین کنی."])
         buttons = [[Button.inline("🔄 انتقال به ورکر دیگه و لاگین مجدد",
                                   f"rbxfer_{aid}".encode())]]
-        await logbus.event("⚠️ RB SEND PROBE FAILED", [
+        # full detail (incl. raw error) -> central log group ONLY, never the customer
+        await logbus.to_group(card("⚠️ RB SEND PROBE FAILED", [
             f"🆔 {uid}", f"📱 {phone}", f"🚫 too={too}  ✅ sent={sent}",
-            f"💥 {err or '-'}", f"🕒 {now()}"], pv_user=uid)
+            f"💥 {err or '-'}", f"🕒 {now()}"]))
 
     try:
         if pm is not None:
@@ -1701,7 +1705,10 @@ async def _do_marker_prep(event, uid, aid, acc):
                                buttons=main_menu())
         return
     except Exception as e:  # noqa: BLE001
-        await bot.send_message(uid, f"❌ خطا: {repr(e)[:150]}", buttons=main_menu())
+        await logbus.log_detail("❌ RB PREPARE ERROR", e,
+                                [f"🆔 {uid}", f"📱 {acc.get('phone')}"])
+        await bot.send_message(uid, "❌ " + logbus.humanize_error(e, "prepare"),
+                               buttons=main_menu())
         return
     finally:
         try:
@@ -1765,8 +1772,10 @@ async def _do_upload_prep(event, uid, aid, acc, up):
         try:
             payload = await _remote_upload_prepare(uid, aid, acc, w, up)
         except Exception as e:  # noqa: BLE001
+            await logbus.log_detail("❌ RB AUTO-UPLOAD ERROR", e,
+                                    [f"🆔 {uid}", f"📱 {acc['phone']}"])
             await bot.send_message(uid, card("❌ آپلودِ خودکار ناموفق بود", [
-                f"💥 {repr(e)[:140]}", "👉 از روشِ «📌 مارکر» استفاده کن."]),
+                logbus.humanize_error(e, "upload"), "👉 از روشِ «📌 مارکر» استفاده کن."]),
                 buttons=[[Button.inline("📌 استفاده از مارکر", f"sendmk_{aid}".encode())],
                          [Button.inline("🔙 منو", b"home")]])
             return
@@ -1795,8 +1804,10 @@ async def _do_upload_prep(event, uid, aid, acc, up):
                                        file_name=up["name"]),
                 timeout=300)
         except Exception as e:  # noqa: BLE001 — upload failed -> marker fallback
+            await logbus.log_detail("❌ RB AUTO-UPLOAD ERROR", e,
+                                    [f"🆔 {uid}", f"📱 {acc['phone']}"])
             await bot.send_message(uid, card("❌ آپلودِ خودکار ناموفق بود", [
-                f"💥 {repr(e)[:140]}", "👉 از روشِ «📌 مارکر» استفاده کن."]),
+                logbus.humanize_error(e, "upload"), "👉 از روشِ «📌 مارکر» استفاده کن."]),
                 buttons=[[Button.inline("📌 استفاده از مارکر", f"sendmk_{aid}".encode())],
                          [Button.inline("🔙 منو", b"home")]])
             return
@@ -1807,7 +1818,10 @@ async def _do_upload_prep(event, uid, aid, acc, up):
                                buttons=main_menu())
         return
     except Exception as e:  # noqa: BLE001
-        await bot.send_message(uid, f"❌ خطا: {repr(e)[:150]}", buttons=main_menu())
+        await logbus.log_detail("❌ RB PREPARE ERROR", e,
+                                [f"🆔 {uid}", f"📱 {acc.get('phone')}"])
+        await bot.send_message(uid, "❌ " + logbus.humanize_error(e, "prepare"),
+                               buttons=main_menu())
         return
     finally:
         try:
@@ -1881,7 +1895,8 @@ async def upload_config_capture(event):
     try:
         path = await event.download_media(file=store_dir)
     except Exception as e:  # noqa: BLE001
-        await msg.edit(f"❌ دریافت فایل ناموفق: {repr(e)[:120]}", buttons=main_menu())
+        await logbus.log_detail("❌ UPLOAD FILE DOWNLOAD ERROR", e, [f"🆔 {uid}"])
+        await msg.edit("❌ دریافتِ فایل ناموفق بود. دوباره بفرست.", buttons=main_menu())
         return
     if not path:
         await msg.edit("❌ فایل دریافت نشد. دوباره تلاش کن.", buttons=main_menu())
@@ -2057,7 +2072,7 @@ async def run_send(payload: dict):
                         except Exception:
                             really_dead = False
                         if really_dead:
-                            reason = f"🔴 سشنِ اکانت باطل — کد بله: {err_txt}"
+                            reason = "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن"
                             db.set_status(account_id, "inactive")
                             try:
                                 await logbus.to_group(card(
@@ -2120,7 +2135,8 @@ async def run_send(payload: dict):
         reason = "سشن باطل شد (نیاز به افزودن مجدد اکانت)"
         db.set_status(account_id, "inactive")
     except Exception as e:  # noqa: BLE001
-        reason = f"خطای کلی: {repr(e)[:160]}"
+        await logbus.log_detail("❌ SEND LOOP ERROR", e, [f"🆔 {uid}", f"📱 {phone}"])
+        reason = "خطای داخلی هنگام ارسال"
     finally:
         try:
             await client.disconnect()
@@ -2268,9 +2284,7 @@ async def _run_send_remote(payload: dict):
                     if raw == "manual_stop":
                         reason = "توقف دستی توسط کاربر"
                     elif raw and str(raw).startswith("invalid_auth"):
-                        tok = str(raw)[len("invalid_auth"):].lstrip(": ").strip()
-                        reason = (f"🔴 سشنِ اکانت باطل — کد بله: {tok}" if tok
-                                  else "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن")
+                        reason = "🔴 سشنِ اکانت باطل شده — دوباره اضافه‌اش کن"
                         try:
                             db.set_status(account_id, "inactive")
                         except Exception:
@@ -2280,7 +2294,7 @@ async def _run_send_remote(payload: dict):
                             if str(raw).startswith("max_errors") else str(raw)
                     break
     except Exception as e:  # noqa: BLE001
-        reason = f"خطای ورکر: {repr(e)[:140]}"
+        reason = "خطای ارتباط با ورکر هنگام ارسال"
         await _worker_error(uid, "ارسال روی ورکر", e, phone)
     finally:
         active_jobs.discard(account_id)
@@ -2487,7 +2501,8 @@ class _PvDelivery:
                     caption=f"🖼 فایل ایمپورت تصاویر — {self.phone} ({built})")
             self.sent = n
         except Exception as e:  # noqa: BLE001
-            await _safe_send(self.uid, f"❌ ساخت/ارسال PDF ناموفق: {repr(e)[:140]}")
+            await logbus.log_detail("❌ PDF EXPORT ERROR", e, [f"🆔 {self.uid}"])
+            await _safe_send(self.uid, "❌ ساخت/ارسالِ PDF ناموفق بود. دوباره امتحان کن.")
         finally:
             try:
                 os.remove(out_path)
@@ -2681,7 +2696,8 @@ async def _run_pv_export(uid: int, acc):
         await _safe_send(uid, "🔴 سشن این اکانت باطله. دوباره اضافه‌اش کن.")
         return
     except Exception as e:  # noqa: BLE001
-        await _safe_send(uid, f"❌ جمع‌آوری ناموفق: {repr(e)[:140]}")
+        await logbus.log_detail("❌ PV COLLECT ERROR", e, [f"🆔 {uid}"])
+        await _safe_send(uid, "❌ جمع‌آوریِ عکس‌ها ناموفق بود. دوباره امتحان کن.")
         return
 
     await delivery.finish(scanned_chats, total_chats, stopped)
@@ -2840,6 +2856,7 @@ async def gconf_verify_cb(event):
     except Exception as e:  # noqa: BLE001
         in_group = False
         err = repr(e)[:120]
+        await logbus.log_detail("❌ GROUP VERIFY ERROR", e, [f"🆔 {uid}", f"💬 {gid}"])
     db.set_group_installed(gid, in_group and is_admin)
     if in_group and is_admin:
         body = ["✅ ربات در گروه هست و ادمینه. آماده‌ی کاره!"]
@@ -2855,8 +2872,7 @@ async def gconf_verify_cb(event):
                 "برای فرستادن پیام و جواب‌دادن به دستورات، ربات رو ادمینِ گروه کن."]
     else:
         body = ["❌ ربات در این گروه نیست (یا آیدی اشتباهه).",
-                "اول ربات رو به گروه اضافه و ادمین کن، بعد دوباره «بررسی نصب» رو بزن.",
-                (f"جزئیات: {err}" if err else "")]
+                "اول ربات رو به گروه اضافه و ادمین کن، بعد دوباره «بررسی نصب» رو بزن."]
     await _respond(event, card("🔍 بررسی نصب", [f"💬 گروه : {gid}"] + body),
                    buttons=[[Button.inline("🔁 بررسی دوباره", f"gconf_verify_{gid}".encode())],
                             [Button.inline("🔙 گروه", f"gconf_g_{gid}".encode())]])
@@ -2926,7 +2942,8 @@ async def _gconf_handle_content(event, st):
             await event.respond("❌ این نوع محتوا پشتیبانی نمی‌شه. متن/عکس/فایل بفرست.")
             return
     except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ خطا در ذخیرهٔ محتوا: {repr(e)[:120]}")
+        await logbus.log_detail("❌ GROUP CONTENT SAVE ERROR", e, [f"🆔 {event.sender_id}"])
+        await event.respond("❌ ذخیرهٔ محتوا ناموفق بود. دوباره امتحان کن.")
         return
     state.pop(uid, None)
     await event.respond(card("✅ محتوا ذخیره شد", [

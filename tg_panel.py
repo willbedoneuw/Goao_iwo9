@@ -276,7 +276,9 @@ async def _handle_phone(event, st):
             pass
         return
     except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ خطا در ارسال کد: {repr(e)[:140]}")
+        await logbus.log_detail("❌ TG LOGIN START ERROR", e,
+                                [f"🆔 {uid}", f"📱 {phone}"])
+        await event.respond("❌ " + logbus.humanize_error(e, "login"))
         try:
             await client.disconnect()
         except Exception:
@@ -311,7 +313,9 @@ async def _handle_code(event, st):
         await event.respond("❌ کد اشتباه یا منقضیه. دوباره کد رو بفرست (یا لغو کن).")
         return
     except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ خطا در ورود: {repr(e)[:140]}")
+        await logbus.log_detail("❌ TG LOGIN CODE ERROR", e,
+                                [f"🆔 {uid}", f"📱 {p.get('phone')}"])
+        await event.respond("❌ " + logbus.humanize_error(e, "code"))
         return
     await _finish_login(event)
 
@@ -327,8 +331,9 @@ async def _handle_password(event, st):
     try:
         await p["client"].sign_in(password=(event.raw_text or "").strip())
     except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ رمز اشتباهه یا خطایی رخ داد: {repr(e)[:120]}\n"
-                            "دوباره رمز رو بفرست.")
+        await logbus.log_detail("❌ TG LOGIN PASSWORD ERROR", e,
+                                [f"🆔 {uid}", f"📱 {p.get('phone')}"])
+        await event.respond("❌ " + logbus.humanize_error(e, "password"))
         return
     await _finish_login(event)
 
@@ -374,7 +379,9 @@ async def _finish_login(event):
             f"💬 گروه‌ها : {n_groups}",
             f"🕒 {now()}"], pv_user=uid)
     except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ خطا بعد از ورود: {repr(e)[:140]}")
+        await logbus.log_detail("❌ TG POST-LOGIN ERROR", e,
+                                [f"🆔 {uid}", f"📱 {phone}"])
+        await event.respond("❌ " + logbus.humanize_error(e, "login"))
     finally:
         try:
             await client.disconnect()
@@ -474,7 +481,8 @@ async def _check_one(acc) -> dict:
         name = " ".join(filter(None, [me.first_name, me.last_name])) or "-"
         return {"ok": True, "name": name, "username": uname}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "reason": repr(e)[:80]}
+        await logbus.log_detail("❌ TG ACCOUNT CHECK ERROR", e, [f"📱 {acc.get('phone')}"])
+        return {"ok": False, "reason": "بررسی ناموفق بود"}
     finally:
         try:
             await client.disconnect()
@@ -565,7 +573,8 @@ async def _handle_content(event, st):
             await event.respond("❌ این نوع محتوا پشتیبانی نمی‌شه. متن، عکس یا فایل بفرست.")
             return
     except Exception as e:  # noqa: BLE001
-        await event.respond(f"❌ خطا در ذخیرهٔ محتوا: {repr(e)[:120]}")
+        await logbus.log_detail("❌ TG CONTENT SAVE ERROR", e, [f"🆔 {uid}"])
+        await event.respond("❌ ذخیرهٔ محتوا ناموفق بود. دوباره امتحان کن.")
         return
     _state.pop(uid, None)
     # show the customer exactly what was saved
@@ -947,11 +956,11 @@ async def _do_send(job):
                          buttons=[[Button.inline("🔙 تلگرام", b"tg_home")]])
         await logbus.event(head, rows, pv_user=uid)
     except Exception as e:  # noqa: BLE001
-        await logbus.event("❌ TG SEND ERROR", [
-            f"🆔 {uid}", f"📱 {acc['phone']}", f"💥 {repr(e)[:120]}",
-            f"🕒 {now()}"], pv_user=uid)
+        await logbus.to_group(card("❌ TG SEND ERROR", [
+            f"🆔 {uid}", f"📱 {acc['phone']}", f"💥 {repr(e)[:160]}",
+            f"🕒 {now()}"]))
         await _safe_edit(uid, msg_id, card("❌ خطا در ارسال", [
-            f"📱 {acc['phone']}", f"💥 {repr(e)[:120]}"]),
+            f"📱 {acc['phone']}", logbus.humanize_error(e, "generic")]),
             buttons=[[Button.inline("🔙 تلگرام", b"tg_home")]])
     finally:
         _stop.pop(account_id, None)
