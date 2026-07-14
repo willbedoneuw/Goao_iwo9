@@ -405,16 +405,40 @@ async def workers_cb(event):
     if not is_owner(event):
         return
     workers = db.list_workers()
+    if not workers:
+        await safe_edit(event,
+                        card("🛠 مدیریت ورکرها", ["هیچ ورکری ثبت نشده."]),
+                        buttons=[[Button.inline("➕ افزودن ورکر", b"w_add")],
+                                 [Button.inline("🔙 بازگشت", b"home")]])
+        return
+
+    # Summary line
+    total = len(workers)
+    healthy = sum(1 for w in workers if w.get("status") == "ok")
+    enabled = sum(1 for w in workers if w.get("enabled"))
+    total_accs = sum(db.count_accounts_on_worker(w["id"]) for w in workers)
+
+    header_rows = [
+        f"📊 کل: {total} | فعال: {enabled} | سالم: {healthy}",
+        f"📱 مجموع اکانت‌ها: {total_accs}",
+    ]
+
     rows = []
     for w in workers:
         emoji = worker.status_emoji(w)
-        tag = w["tag"] + (" (مستر)" if w.get("is_master") else "")
-        rows.append([Button.inline(f"{emoji} {tag} — {w.get('status')}",
-                                   f"w_{w['id']}".encode())])
+        tag = w["tag"]
+        label = " (مستر)" if w.get("is_master") else ""
+        accs = db.count_accounts_on_worker(w["id"])
+        ping = w.get("ping_ms")
+        ping_txt = f"{ping}ms" if (ping is not None and ping >= 0) else "?"
+        enabled_mark = "" if w.get("enabled") else " [غیرفعال]"
+        btn_text = f"{emoji} {tag}{label} | {accs} اکانت | {ping_txt}{enabled_mark}"
+        rows.append([Button.inline(btn_text, f"w_{w['id']}".encode())])
+
     rows.append([Button.inline("➕ افزودن ورکر", b"w_add"),
                  Button.inline("🩺 بررسی همه", b"w_checkall")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
-    await safe_edit(event, "🛠 مدیریت ورکرها:", buttons=rows)
+    await safe_edit(event, card("🛠 مدیریت ورکرها", header_rows), buttons=rows)
 
 
 @bot.on(events.CallbackQuery(data=b"w_checkall"))
@@ -425,11 +449,15 @@ async def w_checkall_cb(event):
     results = await worker.check_all()
     rows = []
     for r in results:
-        rows.append(f"{r.get('tag')} : {r.get('status')} ({r.get('ping_ms')}ms)"
-                    + (f" — {r.get('detail')}" if r.get("detail") else ""))
-    await logbus.to_group(card("🛠 STATU WORKER ALL", rows + [f"🕒 {now()}"]))
-    await safe_edit(event, card("🛠 وضعیت ورکرها", rows or ["— ورکری نیست —"]),
-                    buttons=[[Button.inline("🔙 بازگشت", b"workers")]])
+        emoji = "🟢" if r.get("status") == "ok" else ("🟡" if r.get("ping_ms", -1) >= 0 else "🔴")
+        ping = r.get("ping_ms")
+        ping_txt = f"{ping}ms" if (ping is not None and ping >= 0) else "N/A"
+        detail = f" | {r.get('detail')}" if r.get("detail") else ""
+        rows.append(f"{emoji} {r.get('tag')} : {r.get('status')} ({ping_txt}){detail}")
+    await logbus.to_group(card("🛠 HEALTH CHECK ALL", rows + [f"🕒 {now()}"]))
+    await safe_edit(event, card("🩺 وضعیت ورکرها", rows or ["هیچ ورکری نیست."]),
+                    buttons=[[Button.inline("🔄 بررسی مجدد", b"w_checkall")],
+                             [Button.inline("🔙 بازگشت", b"workers")]])
 
 
 @bot.on(events.CallbackQuery(pattern=b"w_(\\d+)"))
@@ -442,19 +470,31 @@ async def w_menu_cb(event):
         await event.answer("ورکر پیدا نشد.", alert=True)
         return
     accs = db.count_accounts_on_worker(wid)
+    emoji = worker.status_emoji(w)
+    ping = w.get("ping_ms")
+    ping_txt = f"{ping}ms" if (ping is not None and ping >= 0) else "نامشخص"
+    is_master = w.get("is_master")
     rows = [
-        f"🏷 {w['tag']}" + (" (مستر)" if w.get("is_master") else ""),
-        f"🌐 IP : {w.get('ip')}",
-        f"⭐️ وضعیت : {w.get('status')} ({w.get('ping_ms')}ms)",
+        f"🏷 تگ : {w['tag']}" + (" (مستر)" if is_master else ""),
+        f"🌐 IP : {w.get('ip') or 'local'}",
+        LINE,
+        f"{emoji} وضعیت : {w.get('status') or 'unknown'}",
+        f"📡 پینگ : {ping_txt}",
         f"📁 فایل : {worker.file_label(w)}",
+        LINE,
         f"📱 اکانت‌ها : {accs}",
-        f"🔌 فعال : {'بله' if w.get('enabled') else 'خیر'}",
+        f"🔌 فعال : {'بله ✅' if w.get('enabled') else 'خیر ❌'}",
     ]
-    btns = [[Button.inline("🩺 بررسی", f"wchk_{wid}".encode())]]
-    if not w.get("is_master"):
-        toggle = "⏸ غیرفعال" if w.get("enabled") else "▶️ فعال"
-        btns.append([Button.inline(toggle, f"wtog_{wid}".encode()),
-                     Button.inline("🗑 حذف", f"wdel_{wid}".encode())])
+    # Show last health detail if available
+    detail = worker.health_detail(wid)
+    if detail:
+        rows.append(f"💬 جزئیات : {detail}")
+
+    btns = [[Button.inline("🩺 بررسی سلامت", f"wchk_{wid}".encode())]]
+    if not is_master:
+        toggle_label = "⏸ غیرفعال‌کردن" if w.get("enabled") else "▶️ فعال‌کردن"
+        btns.append([Button.inline(toggle_label, f"wtog_{wid}".encode()),
+                     Button.inline("🗑 حذف ورکر", f"wdel_{wid}".encode())])
     btns.append([Button.inline("🔙 بازگشت", b"workers")])
     await safe_edit(event, card("🛠 ورکر", rows), buttons=btns)
 

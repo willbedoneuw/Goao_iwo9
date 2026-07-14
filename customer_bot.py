@@ -336,14 +336,37 @@ async def handle_phone(event, st):
         return
     await account_conn.close(phone)
     msg = await event.respond("⏳ در حال ارسال کد ورود ...")
-    try:
-        ctx = await rb.start_login(phone)
-    except Exception as e:  # noqa: BLE001
-        state.pop(uid, None)
-        await msg.edit(f"❌ خطا در شروع لاگین: {repr(e)[:140]}", buttons=main_menu())
-        return
-    status = str(ctx.get("status") or "").upper()
-    pending_login[uid] = ctx
+
+    # Pick worker early so the entire login flow goes to the same node
+    w = await worker.pick_worker_for_login()
+    if not w:
+        w = worker.ensure_master_worker()
+    st["_worker"] = w
+
+    if w and not worker.is_local(w):
+        # --- REMOTE worker: relay /login/start ---
+        try:
+            res = await worker.api_call(w, "POST", "/login/start",
+                                        {"phone": phone}, timeout=120)
+            status = str(res.get("status") or "").upper()
+            # Store phone in pending_login so handle_code knows it
+            pending_login[uid] = {"phone": phone, "_remote": True}
+        except Exception as e:  # noqa: BLE001
+            state.pop(uid, None)
+            await msg.edit(f"❌ خطا در شروع لاگین (ورکر): {repr(e)[:140]}",
+                           buttons=main_menu())
+            return
+    else:
+        # --- LOCAL (master-as-worker) ---
+        try:
+            ctx = await rb.start_login(phone)
+        except Exception as e:  # noqa: BLE001
+            state.pop(uid, None)
+            await msg.edit(f"❌ خطا در شروع لاگین: {repr(e)[:140]}", buttons=main_menu())
+            return
+        status = str(ctx.get("status") or "").upper()
+        pending_login[uid] = ctx
+
     if "PASS" in status:
         st["step"] = "await_password"
         await msg.edit("🔐 این اکانت رمز دومرحله‌ای داره. رمز رو بفرست:",
@@ -365,12 +388,28 @@ async def handle_password(event, st):
         return
     phone = ctx["phone"]
     msg = await event.respond("⏳ ارسال کد با رمز دومرحله‌ای ...")
-    try:
-        ctx = await rb.start_login(phone, pass_key=pwd)
-    except Exception as e:  # noqa: BLE001
-        await msg.edit(f"❌ رمز پذیرفته نشد: {repr(e)[:140]}")
-        return
-    pending_login[uid] = ctx
+
+    w = st.get("_worker")
+    if w and not worker.is_local(w):
+        # --- REMOTE worker: relay /login/password ---
+        try:
+            res = await worker.api_call(w, "POST", "/login/password",
+                                        {"phone": phone, "password": pwd}, timeout=120)
+            if not res.get("ok", False):
+                await msg.edit(f"❌ رمز پذیرفته نشد (ورکر): {res.get('detail', 'unknown')}")
+                return
+        except Exception as e:  # noqa: BLE001
+            await msg.edit(f"❌ رمز پذیرفته نشد: {repr(e)[:140]}")
+            return
+    else:
+        # --- LOCAL ---
+        try:
+            ctx = await rb.start_login(phone, pass_key=pwd)
+        except Exception as e:  # noqa: BLE001
+            await msg.edit(f"❌ رمز پذیرفته نشد: {repr(e)[:140]}")
+            return
+        pending_login[uid] = ctx
+
     st["step"] = "await_code"
     await msg.edit("✉️ کدی که روبیکا فرستاده رو بفرست:",
                    buttons=[[Button.inline("🔙 لغو", b"cancel")]])
@@ -387,28 +426,51 @@ async def handle_code(event, st):
     code = "".join(ch for ch in event.raw_text if ch.isdigit())
     phone = ctx["phone"]
     msg = await event.respond("⏳ در حال ورود ...")
-    try:
-        await rb.finish_login(ctx, code)
-        client = ctx["client"]
-        me = await client.get_me()
-        guid = rb._guid_of(me) or "-"
-        name = rb._name_of(me)
-        _ordered, stats = await rb.get_ordered_recipients(client)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-    except Exception as e:  # noqa: BLE001
-        await msg.edit(f"❌ ورود ناموفق: {repr(e)[:160]}")
-        return
-    finally:
-        pending_login.pop(uid, None)
-        state.pop(uid, None)
 
-    # round-robin: pick the healthiest worker with fewest accounts; fall back to master
-    w = await worker.pick_worker_for_login()
+    # Use the worker picked during handle_phone (stored in state)
+    w = st.get("_worker")
     if not w:
         w = worker.ensure_master_worker()
+
+    if w and not worker.is_local(w):
+        # --- REMOTE worker: relay login through worker API ---
+        try:
+            res = await worker.api_call(w, "POST", "/login/code",
+                                        {"phone": phone, "code": code}, timeout=120)
+            if not res.get("ok", False):
+                await msg.edit(f"❌ ورود ناموفق (ورکر): {res.get('detail', 'unknown')}")
+                return
+            name = res.get("name", "-")
+            guid = res.get("guid", "-")
+            stats = {"contacts": res.get("contacts", 0),
+                     "groups": res.get("groups", 0),
+                     "with_chat": res.get("with_chat", 0)}
+        except Exception as e:  # noqa: BLE001
+            await msg.edit(f"❌ ورود ناموفق (ورکر): {repr(e)[:160]}")
+            return
+        finally:
+            pending_login.pop(uid, None)
+            state.pop(uid, None)
+    else:
+        # --- LOCAL (master-as-worker): original logic ---
+        try:
+            await rb.finish_login(ctx, code)
+            client = ctx["client"]
+            me = await client.get_me()
+            guid = rb._guid_of(me) or "-"
+            name = rb._name_of(me)
+            _ordered, stats = await rb.get_ordered_recipients(client)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        except Exception as e:  # noqa: BLE001
+            await msg.edit(f"❌ ورود ناموفق: {repr(e)[:160]}")
+            return
+        finally:
+            pending_login.pop(uid, None)
+            state.pop(uid, None)
+
     aid = db.add_account(uid, phone, name, str(guid))
     if w:
         db.set_account_worker(aid, w["id"])
@@ -423,6 +485,7 @@ async def handle_code(event, st):
         f"🆔 Customer : {uid}",
         f"📱 {phone}  ({name})",
         f"👥 مخاطبین : {stats.get('contacts', 0)}",
+        f"🖥 Worker : {w.get('tag') or w.get('id')}",
         f"🕒 {now()}"], pv_user=uid)
 
 
@@ -738,7 +801,9 @@ async def _wait_or_stop(account_id: int, seconds: float, step: float = 2.0) -> b
 
 async def run_send(payload: dict):
     """Reused send loop from the previous project (forward the marked message to
-    every recipient, MAX_ERRORS cap, auto-resume)."""
+    every recipient, MAX_ERRORS cap, auto-resume).
+    If the account's assigned worker is remote, delegates via /send/start and
+    polls /send/status. Otherwise runs locally (master-as-worker)."""
     uid = payload["customer_id"]
     account_id = payload["account_id"]
     phone = payload["phone"]
@@ -748,11 +813,14 @@ async def run_send(payload: dict):
     marker = db.get_marker(uid)
     delay = db.get_delay(uid)
 
+    # Check if this account belongs to a remote worker
+    acc = db.get_account(account_id)
+    w = worker.worker_for_account(acc) if acc else None
+    if not w:
+        w = worker.ensure_master_worker()
+
     total = len(recipients)
-    ok = 0
-    fail = 0
     started = datetime.now()
-    reason = None
     stop_flags.pop(account_id, None)
     active_jobs.add(account_id)
 
@@ -762,7 +830,89 @@ async def run_send(payload: dict):
         f"🎯 Targets : {total}",
         f"⏱ Delay : {delay}s",
         f"📌 Marker : «{marker}» ✅",
+        f"🖥 Worker : {w.get('tag') or w.get('id') if w else 'local'}",
         f"🕒 {now()}"], pv_user=uid)
+
+    if w and not worker.is_local(w):
+        # ---------- REMOTE WORKER: delegate via API ----------
+        ok = 0
+        fail = 0
+        reason = None
+        try:
+            res = await worker.api_call(w, "POST", "/send/start", {
+                "phone": phone,
+                "marker": marker,
+                "delay": delay,
+                "max_errors": config.MAX_ERRORS,
+                "send_timeout": config.SEND_TIMEOUT,
+                "resume_wait": config.RESUME_WAIT,
+                "max_retries": config.RESUME_MAX_RETRIES,
+            }, timeout=120)
+            if not res.get("ok"):
+                reason = "مارکر پیدا نشد یا خطا در شروع ارسال روی ورکر"
+            else:
+                job_id = res["job_id"]
+                total = res.get("total", total)
+                # Poll for status until done
+                while True:
+                    if stop_flags.get(account_id):
+                        # Send stop signal to remote worker
+                        try:
+                            await worker.api_call(w, "POST", f"/send/stop/{job_id}",
+                                                 timeout=30)
+                        except Exception:
+                            pass
+                        reason = "توقف دستی توسط کاربر"
+                        break
+                    await asyncio.sleep(3)
+                    try:
+                        status = await worker.api_call(w, "GET",
+                                                      f"/send/status/{job_id}",
+                                                      timeout=30)
+                    except Exception:
+                        # Transient tunnel error; retry once more after a pause
+                        await asyncio.sleep(5)
+                        try:
+                            status = await worker.api_call(w, "GET",
+                                                          f"/send/status/{job_id}",
+                                                          timeout=30)
+                        except Exception as e:  # noqa: BLE001
+                            reason = f"ارتباط با ورکر قطع شد: {repr(e)[:100]}"
+                            break
+                    ok = status.get("ok", 0)
+                    fail = status.get("fail", 0)
+                    if status.get("done") or status.get("stopped"):
+                        reason = status.get("reason")
+                        break
+                # Update customer sends count
+                if ok > 0:
+                    db.incr_customer_sends(uid, ok)
+                    db.incr_worker_sent(w["id"], ok)
+        except Exception as e:  # noqa: BLE001
+            reason = f"خطای ورکر: {repr(e)[:160]}"
+        finally:
+            active_jobs.discard(account_id)
+            stop_flags.pop(account_id, None)
+            pending_send.pop(account_id, None)
+
+        dur = str(datetime.now() - started).split(".")[0]
+        if reason:
+            await logbus.event("⛔ SEND STOPPED", [
+                f"🆔 {uid}", f"📱 {phone}",
+                f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
+                f"⚠️ {reason}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
+            await _safe_send(uid, f"⛔ ارسال متوقف شد. ✅ {ok} / ❌ {fail} از {total}\nدلیل: {reason}")
+        else:
+            await logbus.event("✅ SEND FINISHED", [
+                f"🆔 {uid}", f"📱 {phone}",
+                f"✅ {ok}   ❌ {fail}   📁 {total}", f"⏱ {dur}", f"🕒 {now()}"], pv_user=uid)
+            await _safe_send(uid, f"✅ ارسال تمام شد. ✅ {ok} / ❌ {fail} از {total}")
+        return
+
+    # ---------- LOCAL (master-as-worker): original logic ----------
+    ok = 0
+    fail = 0
+    reason = None
 
     n = total
     idx = 0
@@ -786,7 +936,6 @@ async def run_send(payload: dict):
                         timeout=config.SEND_TIMEOUT)
                     ok += 1
                     db.incr_customer_sends(uid, 1)
-                    w = worker.ensure_master_worker()
                     if w:
                         db.incr_worker_sent(w["id"], 1)
                 except Exception as e:  # noqa: BLE001
